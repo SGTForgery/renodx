@@ -863,7 +863,7 @@ renodx::utils::settings::Settings settings = {
         .key = "SwapChainEncoding",
         .binding = &shader_injection.swap_chain_encoding,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 4.f,
+        .default_value = 5.f,
         .label = "Encoding",
         .section = "Display Output",
         .labels = {"None", "SRGB", "2.2", "2.4", "HDR10", "scRGB"},
@@ -947,7 +947,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = std::string("- Special thanks to both Musa & Miru for helping with the addon"),
+        .label = std::string("- Special thanks to Ritsu, Musa, and Miru for helping with the addon"),
         .section = "About",
     },
     new renodx::utils::settings::Setting{
