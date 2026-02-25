@@ -16,6 +16,7 @@
 #include "./math.hlsl"
 #include "./random.hlsl"
 #include "./tonemap.hlsl"
+#include "./rendering.hlsl"
 
 #include "./deprecated.hlsl"
 

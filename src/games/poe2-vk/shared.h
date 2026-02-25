@@ -1,5 +1,5 @@
-#ifndef SRC_ENDFIELD_SHARED_H_
-#define SRC_ENDFIELD_SHARED_H_
+#ifndef SRC_POE2_VK_SHARED_H_
+#define SRC_POE2_VK_SHARED_H_
 
 // Must be 32bit aligned
 // Should be 4x32
@@ -38,29 +38,15 @@ struct ShaderInjectData {
   float swap_chain_clamp_color_space;
   float swap_chain_encoding;
   float swap_chain_encoding_color_space;
-  float custom_flip_uv_y;
-  float fx_rcas_sharpening;
-  float fx_rcas_amount;
-  float tone_map_hdr_video;
-  float tone_map_video_nits;
   float reno_drt_tone_map_method;
-  float status_text_opacity;
-  float ping_text_opacity;
-  float ui_disable_ping;
-  float ui_disable_uid;
   float custom_random;
   float custom_grain_strength;
   float vignette_strength;
-  float ui_visibility;
-  float sun_intensity;
   float bloom_strength;
-  float godrays_intensity;
+  float bloom_scaling;
   float perchannelblowout;
-  float fog_modification;
-  float shadow_hardening;
-  float chromatic_aberration_strength;
-  float cubemap_ambient_link;
-  float glass_transparency;
+  float ao_strength;
+  float hide_ui;
 };
 
 #ifndef __cplusplus
@@ -128,23 +114,17 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_TONE_MAP_HDR_VIDEO              shader_injection.tone_map_hdr_video
 #define RENODX_VIDEO_NITS                      shader_injection.tone_map_video_nits
 #define RENODX_RENO_DRT_TONE_MAP_METHOD        shader_injection.reno_drt_tone_map_method
-#define PING_TEXT_OPACITY                      shader_injection.ping_text_opacity
-#define STATUS_TEXT_OPACITY                    shader_injection.status_text_opacity
 #define CUSTOM_RANDOM                          shader_injection.custom_random
 #define CUSTOM_GRAIN_STRENGTH                  shader_injection.custom_grain_strength
 #define VIGNETTE_STRENGTH                      shader_injection.vignette_strength
-#define UI_VISIBILITY                          shader_injection.ui_visibility
-#define SUN_INTENSITY                          shader_injection.sun_intensity
 #define BLOOM_STRENGTH                         shader_injection.bloom_strength
-#define GODRAYS_INTENSITY                      shader_injection.godrays_intensity
+#define BLOOM_SCALING                          shader_injection.bloom_scaling
 #define PER_CHANNEL_BLOWOUT                    shader_injection.perchannelblowout
-#define SHADOW_HARDENING                       shader_injection.shadow_hardening
-#define CHROMATIC_ABERRATION_STRENGTH          shader_injection.chromatic_aberration_strength
-#define FOG_MODIFICATION                       shader_injection.fog_modification
-#define GLASS_TRANSPARENCY                     shader_injection.glass_transparency
+#define AO_STRENGTH                            shader_injection.ao_strength
+#define RENODX_HIDE_UI                             shader_injection.hide_ui
 
 #include "../../shaders/renodx.hlsl"
 
 #endif
 
-#endif  // SRC_ENDFIELD_SHARED_H_
+#endif  // SRC_POE2_VK_SHARED_H_

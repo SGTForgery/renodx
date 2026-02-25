@@ -10,10 +10,6 @@
 // #define DEBUG_LEVEL_1
 // #define DEBUG_LEVEL_2
 
-#include <shared_mutex>
-#include <sstream>
-#include <cstring>
-
 #include <embed/shaders.h>
 
 #include <deps/imgui/imgui.h>
@@ -35,143 +31,13 @@ renodx::mods::shader::CustomShaders custom_shaders = {__ALL_CUSTOM_SHADERS};
 ShaderInjectData shader_injection;
 
 float current_settings_mode = 0;
-float current_render_reshade_before_ui = 0;
 
 bool UsingSwapchainUpgrade() {
   return true;
 }
 
 bool UsingSwapchainUtil() {
-  return (current_render_reshade_before_ui != 0.f
-          || UsingSwapchainUpgrade());
-}
-
-// Helper to update resolution-based uniform variables in ReShade effects
-void UpdateReshadeResolutionUniforms(reshade::api::effect_runtime* runtime, uint32_t width, uint32_t height) {
-    float fwidth = static_cast<float>(width);
-    float fheight = static_cast<float>(height);
-
-    // Enumerate all uniform variables and update those with resolution-related source annotations
-    runtime->enumerate_uniform_variables(nullptr, [fwidth, fheight](reshade::api::effect_runtime* rt, reshade::api::effect_uniform_variable variable) {
-        char source[64] = {};
-        if (rt->get_annotation_string_from_uniform_variable(variable, "source", source)) {
-            // Update BUFFER_WIDTH uniform
-            if (std::strcmp(source, "bufwidth") == 0) {
-                rt->set_uniform_value_float(variable, fwidth);
-            }
-            // Update BUFFER_HEIGHT uniform
-            else if (std::strcmp(source, "bufheight") == 0) {
-                rt->set_uniform_value_float(variable, fheight);
-            }
-            // Update reciprocal width (1.0 / BUFFER_WIDTH)
-            else if (std::strcmp(source, "rcpwidth") == 0 || std::strcmp(source, "bufwidth_rcp") == 0) {
-                rt->set_uniform_value_float(variable, 1.0f / fwidth);
-            }
-            // Update reciprocal height (1.0 / BUFFER_HEIGHT)
-            else if (std::strcmp(source, "rcpheight") == 0 || std::strcmp(source, "bufheight_rcp") == 0) {
-                rt->set_uniform_value_float(variable, 1.0f / fheight);
-            }
-            // Update BUFFER_RCP_WIDTH (alternative naming convention)
-            else if (std::strcmp(source, "buffer_rcp_width") == 0) {
-                rt->set_uniform_value_float(variable, 1.0f / fwidth);
-            }
-            // Update BUFFER_RCP_HEIGHT (alternative naming convention)
-            else if (std::strcmp(source, "buffer_rcp_height") == 0) {
-                rt->set_uniform_value_float(variable, 1.0f / fheight);
-            }
-            // Update pixel size (float2 with 1/width, 1/height)
-            else if (std::strcmp(source, "pixelsize") == 0) {
-                float pixel_size[2] = { 1.0f / fwidth, 1.0f / fheight };
-                rt->set_uniform_value_float(variable, pixel_size, 2);
-            }
-            // Update screen size (float2 with width, height)
-            else if (std::strcmp(source, "screensize") == 0) {
-                float screen_size[2] = { fwidth, fheight };
-                rt->set_uniform_value_float(variable, screen_size, 2);
-            }
-        }
-    });
-}
-
-// Track the last known RTV resolution to detect resolution changes
-uint32_t last_rtv_width = 0;
-uint32_t last_rtv_height = 0;
-
-// Flag to track if we're currently executing our bypass render
-// This prevents ReShade from rendering during normal present while allowing our bypass to work
-bool bypass_render_active = false;
-
-// Callback to disable effects during normal present when bypass is enabled
-// This prevents double-rendering (once via bypass, once via normal present)
-void OnReshadeBeginEffects(reshade::api::effect_runtime* runtime,
-                                                     reshade::api::command_list* cmd_list,
-                                                     reshade::api::resource_view rtv,
-                                                     reshade::api::resource_view rtv_srgb) {
-    // Only intercept if bypass is enabled AND we're not currently in bypass render
-    // When bypass is disabled (current_render_reshade_before_ui == 0), let ReShade render normally
-    if (current_render_reshade_before_ui != 0.f && !bypass_render_active) {
-        runtime->set_effects_state(false);
-    }
-}
-
-// Callback to re-enable effects after present (keeps effects available for bypass)
-void OnReshadeFinishEffects(reshade::api::effect_runtime* runtime,
-                                                        reshade::api::command_list* cmd_list,
-                                                        reshade::api::resource_view rtv,
-                                                        reshade::api::resource_view rtv_srgb) {
-    // Only re-enable if bypass is enabled AND we disabled them
-    if (current_render_reshade_before_ui != 0.f && !bypass_render_active) {
-        runtime->set_effects_state(true);
-    }
-}
-
-bool ExecuteReshadeEffects(reshade::api::command_list* cmd_list) {
-    if (current_render_reshade_before_ui == 0.f) return true;
-    if (!UsingSwapchainUtil()) return true;
-
-    auto* cmd_list_data = renodx::utils::data::Get<renodx::utils::swapchain::CommandListData>(cmd_list);
-    if (cmd_list_data == nullptr) return true;
-    if (cmd_list_data->current_render_targets.empty()) return true;
-
-    // Get the ORIGINAL RTV from deferred lighting - do NOT use the clone here
-    // The clone is at swapchain resolution (e.g., 3840x2160) but we want to render
-    // ReShade effects at the pre-upscale resolution
-    auto rtv0 = cmd_list_data->current_render_targets[0];
-    if (rtv0.handle == 0) return true;
-    auto* device = cmd_list->get_device();
-    auto* data = renodx::utils::data::Get<renodx::utils::swapchain::DeviceData>(device);
-    if (data == nullptr) return true;
-
-    // Get the render target resolution
-    auto resource = device->get_resource_from_view(rtv0);
-    auto resource_desc = device->get_resource_desc(resource);
-    uint32_t rtv_width = resource_desc.texture.width;
-    uint32_t rtv_height = resource_desc.texture.height;
-
-    const std::shared_lock lock(data->mutex);
-    for (auto* runtime : data->effect_runtimes) {
-        if (rtv_width != last_rtv_width || rtv_height != last_rtv_height) {
-            uint32_t swapchain_width = 0;
-            uint32_t swapchain_height = 0;
-            runtime->get_screenshot_width_and_height(&swapchain_width, &swapchain_height);
-
-            std::stringstream ss;
-            ss << "[Endfield] ExecuteReshadeEffects: Rendering at RTV=" << rtv_width << "x" << rtv_height
-                 << " (Swapchain=" << swapchain_width << "x" << swapchain_height << ")";
-            reshade::log::message(reshade::log::level::info, ss.str().c_str());
-
-            last_rtv_width = rtv_width;
-            last_rtv_height = rtv_height;
-        }
-
-        UpdateReshadeResolutionUniforms(runtime, rtv_width, rtv_height);
-        bypass_render_active = true;
-        runtime->set_effects_state(true);
-        runtime->render_effects(cmd_list, rtv0, rtv0);
-        bypass_render_active = false;
-    }
-
-    return true;
+  return UsingSwapchainUpgrade();
 }
 
 // Hotkey state tracking
@@ -735,38 +601,6 @@ renodx::utils::settings::Settings settings = {
         .max = 100.f,
     },
     new renodx::utils::settings::Setting{
-        .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
-        .label = std::string("Reshade shader bypass, applies on_drawn after game's deferred lighting pass. Only properly works with DLAA/TAAU 100 scaling atm"),
-        .on_draw = []() {
-          ImGui::SetWindowFontScale(2.0f);
-          ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.0f, 0.0f, 1.0f));
-          ImGui::TextWrapped("Reshade shader bypass, applies on_drawn after game's deferred lighting pass. Only properly works with DLAA/TAAU 100 scaling atm");
-          ImGui::PopStyleColor();
-          ImGui::SetWindowFontScale(1.0f);
-          return false;
-        },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "RenderReshadeBeforeUI",
-        .binding = &current_render_reshade_before_ui,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "ReShade Before UI",
-        .section = "Effects",
-        .tooltip = "Executes ReShade effects before UI is drawn.",
-        .labels = {"Off", "On"},
-    },
-    new renodx::utils::settings::Setting{
-        .key = "DisableGameAO",
-        .binding = &shader_injection.disable_game_ao,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "Disable Game GTAO",
-        .section = "Effects",
-        .tooltip = "Disables the game's built-in GTAO (Ground Truth Ambient Occlusion).\nUseful when using ReShade-based AO instead.",
-        .labels = {"Off", "On"},
-    },
-    new renodx::utils::settings::Setting{
         .key = "HDRSun",
         .binding = &shader_injection.sun_intensity,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
@@ -806,17 +640,6 @@ renodx::utils::settings::Settings settings = {
         .section = "Rendering Improvements",
         .tooltip = "Toggles alternative hue-preserving fog",
         .labels = {"Original", "Alt"},
-    },
-    new renodx::utils::settings::Setting{
-        .key = "MetallicIBLIntensity",
-        .binding = &shader_injection.metallic_ibl_intensity,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "Metallic IBL Intensity",
-        .section = "Rendering Improvements",
-        .tooltip = "Controls image-based lighting intensity on metallic surfaces",
-        .labels = {"Vanilla", "Alt"},
-        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "CubemapAmbientLink",
@@ -1101,7 +924,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           .view_upgrades = view_upgrades,
           .min_dimensions = min_dimensions,
       });
-      /*
+
       renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
           .old_format = reshade::api::format::r10g10b10a2_unorm,
           .new_format = target_format,
@@ -1133,7 +956,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
           .view_upgrades = view_upgrades,
           .min_dimensions = min_dimensions,
       });
-      /*
+
       renodx::mods::swapchain::swap_chain_upgrade_targets.push_back({
           .old_format = reshade::api::format::r8g8b8a8_unorm,
           .new_format = target_format,
@@ -1287,10 +1110,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                         shader_injection.custom_flip_uv_y = 0.f;
                     }
                     reshade::register_event<reshade::addon_event::present>(OnPresent);
-                    // Register callbacks to ALWAYS disable ReShade during normal present
-                    // This ensures ReShade only ever renders at internal resolution via bypass
-                    reshade::register_event<reshade::addon_event::reshade_begin_effects>(OnReshadeBeginEffects);
-                    reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnReshadeFinishEffects);
                     settings.push_back(setting);
                 }
 
@@ -1336,49 +1155,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                     settings.push_back(setting);
                 }
 
-                const uint32_t target_crcs[] = {
-                        0x00C16AFBu,
-                        0x039C28DAu,
-                        0x086097D2u,
-                        0x09270FDAu,
-                        0x0E520F06u,
-                        0x10076711u,
-                        0x21241B7Au,
-                        0x51359B4Du,
-                        0x53875523u,
-                        0x53D50BD5u,
-                        0x57737D9Fu,
-                        0x5FC0BD3Cu,
-                        0x6166487Au,
-                        0x61908D50u,
-                        0x64CEB255u,
-                        0x6A76C719u,
-                        0x86420EBCu,
-                        0x9790A50Cu,
-                        0x9AA3FC1Fu,
-                        0xA6501734u,
-                        0xA6E6ABE6u,
-                        0xA8213A68u,
-                        0xAFDCA263u,
-                        0xAFECA8F4u,
-                        0xBCD91195u,
-                        0xD5BC74ACu,
-                        0xE0058043u,
-                        0xF8FA587Fu,
-                };
-
-                for (uint32_t crc : target_crcs) {
-                    auto it = custom_shaders.find(crc);
-                    if (it == custom_shaders.end()) {
-                        renodx::mods::shader::CustomShader cs{};
-                        cs.crc32 = crc;
-                        cs.on_drawn = ExecuteReshadeEffects;
-                        custom_shaders.emplace(crc, std::move(cs));
-                    } else {
-                        it->second.on_drawn = ExecuteReshadeEffects;
-                    }
-                }
-
                 // Add on_draw callbacks for ping/UID shaders (heuristic-based detection)
                 // Ping/latency bar shader: 0xEF07F89A
                 {
@@ -1407,8 +1183,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
             reshade::unregister_event<reshade::addon_event::draw>(OnDraw);
             reshade::unregister_event<reshade::addon_event::draw_indexed>(OnDrawIndexed);
             reshade::unregister_event<reshade::addon_event::present>(OnPresent);
-            reshade::unregister_event<reshade::addon_event::reshade_begin_effects>(OnReshadeBeginEffects);
-            reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(OnReshadeFinishEffects);
             reshade::unregister_addon(h_module);
             break;
   }
