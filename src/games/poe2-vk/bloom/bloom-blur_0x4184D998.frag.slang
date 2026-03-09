@@ -33,6 +33,19 @@ void frag_main()
     float2 texel_size = 1.0f.xx / float2(float(cdepth_aware_blur_cb_viewport_width), float(cdepth_aware_blur_cb_viewport_height));
     float2 uv = gl_FragCoord.xy * texel_size;
 
+    // Per-pixel stochastic rotation angle (IGN + per-frame temporal offset).
+    // Breaks the fixed diagonal tap pattern into smooth per-pixel noise,
+    // eliminating visible ring stairstepping and temporal jitter.
+    float noise = frac(InterleavedGradientNoise(gl_FragCoord.xy) + CUSTOM_RANDOM);
+    float angle = noise * 6.28318530718f;
+    float ca = cos(angle);
+    float sa = sin(angle);
+
+    // Pre-rotate the two independent diagonal unit vectors (d3 and d1).
+    // d0 = -d3, d2 = -d1, so we sample at ±r_a and ±r_b per mip.
+    float2 r_a = 0.5f * float2(ca - sa, sa + ca);
+    float2 r_b = 0.5f * float2(ca + sa, sa - ca);
+
     float total_weight = 0.0f;
     float4 total_color = 0.0f.xxxx;
 
@@ -52,13 +65,17 @@ void frag_main()
         
         float2 offset = texel_size * exp2(fmip);
 
-        // 4-tap bilinear filter at diagonal half-texel offsets.
-        // Each bilinear tap blends a 2x2 texel region at the requested LOD;
-        // four overlapping taps produce a smooth 3x3 tent kernel per level.
-        float4 s  = src_sampler.SampleLevel(SamplerLinearClampNoBias, uv + float2(-0.5f, -0.5f) * offset, fmip);
-        s        += src_sampler.SampleLevel(SamplerLinearClampNoBias, uv + float2( 0.5f, -0.5f) * offset, fmip);
-        s        += src_sampler.SampleLevel(SamplerLinearClampNoBias, uv + float2(-0.5f,  0.5f) * offset, fmip);
-        s        += src_sampler.SampleLevel(SamplerLinearClampNoBias, uv + float2( 0.5f,  0.5f) * offset, fmip);
+        // 4-tap filter with stochastically rotated diagonal offsets.
+        // Each bilinear tap blends a 2×2 texel region at the requested LOD;
+        // the per-pixel rotation spreads sampling error into smooth noise
+        // that converges cleanly under TAA.
+        float2 oa = r_a * offset;
+        float2 ob = r_b * offset;
+
+        float4 s  = src_sampler.SampleLevel(SamplerLinearClampNoBias, uv + oa, fmip);
+        s        += src_sampler.SampleLevel(SamplerLinearClampNoBias, uv - oa, fmip);
+        s        += src_sampler.SampleLevel(SamplerLinearClampNoBias, uv + ob, fmip);
+        s        += src_sampler.SampleLevel(SamplerLinearClampNoBias, uv - ob, fmip);
         s        *= 0.25f;
 
         total_weight += mip_weight;

@@ -47,6 +47,10 @@ struct ShaderInjectData {
   float perchannelblowout;
   float ao_strength;
   float hide_ui;
+  float isfast_noise_bound;
+  float pad0;
+  float pad1;
+  float pad2;
 };
 
 #ifndef __cplusplus
@@ -122,6 +126,7 @@ cbuffer shader_injection : register(b13) {
 #define PER_CHANNEL_BLOWOUT                    shader_injection.perchannelblowout
 #define AO_STRENGTH                            shader_injection.ao_strength
 #define RENODX_HIDE_UI                             shader_injection.hide_ui
+#define ISFAST_NOISE_BOUND                          shader_injection.isfast_noise_bound
 
 #include "../../shaders/renodx.hlsl"
 

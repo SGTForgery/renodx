@@ -10,6 +10,9 @@
 // #define DEBUG_LEVEL_1
 // #define DEBUG_LEVEL_2
 
+#include <filesystem>
+#include <fstream>
+
 #include <embed/shaders.h>
 
 #include <deps/imgui/imgui.h>
@@ -29,6 +32,12 @@ namespace {
 renodx::mods::shader::CustomShaders custom_shaders = {__ALL_CUSTOM_SHADERS};
 
 ShaderInjectData shader_injection;
+
+// --- IS-FAST noise texture globals ---
+HMODULE g_hmodule = nullptr;
+reshade::api::resource g_isfast_texture = {0};
+reshade::api::resource_view g_isfast_srv = {0};
+reshade::api::sampler g_isfast_sampler = {0};
 
 float current_settings_mode = 0;
 
@@ -428,6 +437,135 @@ renodx::utils::settings::UpdateSetting("SwapChainGammaCorrection", 0.f);
 
 }
 
+// --- IS-FAST texture loading ---
+void OnISFASTInitDevice(reshade::api::device* device) {
+  // Locate DDS file next to addon DLL
+  wchar_t module_path[MAX_PATH];
+  GetModuleFileNameW(g_hmodule, module_path, MAX_PATH);
+  auto dds_path = std::filesystem::path(module_path).parent_path() / L"fast_noise_ea.dds";
+
+  std::ifstream file(dds_path, std::ios::binary | std::ios::ate);
+  if (!file.is_open()) {
+    reshade::log::message(reshade::log::level::warning,
+        "IS-FAST: fast_noise_ea.dds not found next to addon DLL, noise texture disabled");
+    return;
+  }
+
+  auto file_size = static_cast<size_t>(file.tellg());
+  file.seekg(0);
+  std::vector<uint8_t> dds_data(file_size);
+  file.read(reinterpret_cast<char*>(dds_data.data()), file_size);
+  file.close();
+
+  // Validate DDS magic
+  if (file_size < 128 || dds_data[0] != 'D' || dds_data[1] != 'D'
+      || dds_data[2] != 'S' || dds_data[3] != ' ') {
+    reshade::log::message(reshade::log::level::error, "IS-FAST: Invalid DDS file");
+    return;
+  }
+
+  // Parse DDS header
+  uint32_t height = *reinterpret_cast<uint32_t*>(&dds_data[12]);
+  uint32_t width  = *reinterpret_cast<uint32_t*>(&dds_data[16]);
+  uint32_t depth  = *reinterpret_cast<uint32_t*>(&dds_data[24]);
+  uint32_t four_cc = *reinterpret_cast<uint32_t*>(&dds_data[84]);
+
+  uint32_t header_size = 128;  // 4 magic + 124 DDS_HEADER
+  if (four_cc == 0x30315844u) { // "DX10" extended header
+    header_size = 148;         // + 20 DDS_HEADER_DX10
+  }
+  if (depth == 0) depth = 1;
+
+  if (file_size < header_size) {
+    reshade::log::message(reshade::log::level::error, "IS-FAST: DDS file too small");
+    return;
+  }
+
+  const uint8_t* pixel_data = dds_data.data() + header_size;
+  uint32_t bpp = 2;  // RG8_UNORM = 2 bytes per texel
+  uint32_t row_pitch   = width * bpp;
+  uint32_t slice_pitch = row_pitch * height;
+
+  // Create Texture3D
+  reshade::api::resource_desc tex_desc = {};
+  tex_desc.type = reshade::api::resource_type::texture_3d;
+  tex_desc.texture.width  = width;
+  tex_desc.texture.height = height;
+  tex_desc.texture.depth_or_layers = static_cast<uint16_t>(depth);
+  tex_desc.texture.levels = 1;
+  tex_desc.texture.format = reshade::api::format::r8g8_unorm;
+  tex_desc.texture.samples = 1;
+  tex_desc.heap  = reshade::api::memory_heap::gpu_only;
+  tex_desc.usage = reshade::api::resource_usage::shader_resource;
+  tex_desc.flags = reshade::api::resource_flags::none;
+
+  reshade::api::subresource_data initial_data = {};
+  initial_data.data        = const_cast<uint8_t*>(pixel_data);
+  initial_data.row_pitch   = row_pitch;
+  initial_data.slice_pitch = slice_pitch;
+
+  if (!device->create_resource(tex_desc, &initial_data,
+        reshade::api::resource_usage::shader_resource, &g_isfast_texture)) {
+    reshade::log::message(reshade::log::level::error, "IS-FAST: Failed to create Texture3D");
+    return;
+  }
+
+  // Create SRV
+  reshade::api::resource_view_desc srv_desc = {};
+  srv_desc.type = reshade::api::resource_view_type::texture_3d;
+  srv_desc.format = reshade::api::format::r8g8_unorm;
+  srv_desc.texture.first_level = 0;
+  srv_desc.texture.level_count = 1;
+  srv_desc.texture.first_layer = 0;
+  srv_desc.texture.layer_count = 1;
+
+  if (!device->create_resource_view(g_isfast_texture,
+        reshade::api::resource_usage::shader_resource, srv_desc, &g_isfast_srv)) {
+    reshade::log::message(reshade::log::level::error, "IS-FAST: Failed to create SRV");
+    device->destroy_resource(g_isfast_texture);
+    g_isfast_texture = {0};
+    return;
+  }
+
+  // Create point-wrap sampler
+  reshade::api::sampler_desc samp_desc = {};
+  samp_desc.filter    = reshade::api::filter_mode::min_mag_mip_point;
+  samp_desc.address_u = reshade::api::texture_address_mode::wrap;
+  samp_desc.address_v = reshade::api::texture_address_mode::wrap;
+  samp_desc.address_w = reshade::api::texture_address_mode::wrap;
+
+  if (!device->create_sampler(samp_desc, &g_isfast_sampler)) {
+    reshade::log::message(reshade::log::level::error, "IS-FAST: Failed to create sampler");
+    device->destroy_resource_view(g_isfast_srv);
+    device->destroy_resource(g_isfast_texture);
+    g_isfast_srv = {0};
+    g_isfast_texture = {0};
+    return;
+  }
+
+  shader_injection.isfast_noise_bound = 1.0f;
+
+  std::stringstream s;
+  s << "IS-FAST: Noise texture loaded (" << width << "x" << height << "x" << depth << " RG8)";
+  reshade::log::message(reshade::log::level::info, s.str().c_str());
+}
+
+void OnISFASTDestroyDevice(reshade::api::device* device) {
+  shader_injection.isfast_noise_bound = 0.0f;
+  if (g_isfast_sampler.handle != 0) {
+    device->destroy_sampler(g_isfast_sampler);
+    g_isfast_sampler = {0};
+  }
+  if (g_isfast_srv.handle != 0) {
+    device->destroy_resource_view(g_isfast_srv);
+    g_isfast_srv = {0};
+  }
+  if (g_isfast_texture.handle != 0) {
+    device->destroy_resource(g_isfast_texture);
+    g_isfast_texture = {0};
+  }
+}
+
 void OnPresent(reshade::api::command_queue* queue,
                              reshade::api::swapchain* swapchain,
                              const reshade::api::rect* source_rect,
@@ -446,6 +584,7 @@ extern "C" __declspec(dllexport) constexpr const char* NAME = "RenoDX";
 extern "C" __declspec(dllexport) constexpr const char* DESCRIPTION = "RenoDX for Path of Exile 2 - (Vulkan)";
 
 BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
+  g_hmodule = h_module;
   auto use_resource_view_cloning = false;
   const auto target_format = reshade::api::format::r16g16b16a16_float;
   const auto view_upgrades = renodx::utils::resource::VIEW_UPGRADES_RGBA16F;
@@ -500,6 +639,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
                 renodx::mods::swapchain::use_device_proxy = false;
                 renodx::mods::swapchain::set_color_space = true;
                 reshade::register_event<reshade::addon_event::present>(OnPresent);
+                reshade::register_event<reshade::addon_event::init_device>(OnISFASTInitDevice);
+                reshade::register_event<reshade::addon_event::destroy_device>(OnISFASTDestroyDevice);
                 renodx::mods::swapchain::device_proxy_wait_idle_source = false;
                 renodx::mods::swapchain::device_proxy_wait_idle_destination = false;
 
@@ -509,6 +650,8 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
         case DLL_PROCESS_DETACH:
             reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+            reshade::unregister_event<reshade::addon_event::init_device>(OnISFASTInitDevice);
+            reshade::unregister_event<reshade::addon_event::destroy_device>(OnISFASTDestroyDevice);
             reshade::unregister_addon(h_module);
             break;
   }

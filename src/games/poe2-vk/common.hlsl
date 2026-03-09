@@ -1,6 +1,12 @@
 #include "./shared.h"
 #include "../../shaders/color/macleod_boynton.hlsl"
 
+// Interleaved Gradient Noise (Jimenez 2014)
+// Returns a scalar in [0,1) with good spatial blue-noise properties.
+float InterleavedGradientNoise(float2 pixelCoord) {
+  return frac(52.9829189 * frac(0.06711056 * pixelCoord.x + 0.00583715 * pixelCoord.y));
+}
+
 // Luminance-based gamma correction that preserves per-channel chrominance (hue).
 float3 ApplyGammaCorrectionByLuminance(float3 color_input) {
   float y_in = renodx::color::y::from::BT709(color_input);
