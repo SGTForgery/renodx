@@ -12,11 +12,17 @@
 // ║  4. Fog color correction           (OKLab hue/chroma/lightness restoration)  ║
 // ║  5. Grass rendering improvements   (GoT-inspired VS/PS enhancements)         ║
 // ║  6. Indirect lighting helpers      (GoT-inspired SH, bounce, leak fix,       ║
-// ║                                     horizon occlusion, roughness parallax)   ║
+// ║                                     horizon occlusion, roughness parallax,   ║
+// ║                                     Chebyshev visibility, backface reject,   ║
+// ║                                     irradiance sharpening, SSGI approx)      ║
 // ║  7. Atmospheric scattering helpers  (GoT Rayleigh LMS color space)           ║
 // ║  8. Volumetric haze anti-aliasing  (tricubic B-spline, L/α decomposition)    ║
-// ║  9. Bent normal shadows            (AO cone visibility for directional light)║
-// ║  10. SS shadow depth-bias micro detail  (Bend Studio thickness-aware shadow) ║
+// ║  9. Bent normal shadows            (AO cone visibility, SS bent normal,      ║
+// ║                                     indirect redirection, cosine spec occ)   ║
+// ║  10. SS shadow depth-bias micro detail  (Bend Studio thickness-aware shadow, ║
+// ║                                          visibility bitmap, confidence-      ║
+// ║                                          adaptive pipeline, hash denoiser,   ║
+// ║                                          FFXVI oriented depth bias)          ║
 // ║  11. Subsurface raymarching          (PoE2 texture-space volume via TBN)     ║
 // ║  12. IS-FAST noise sampling          (importance-sampled spatio-temporal BN) ║
 // ║  13. GPU Friendly Laplacian Texture Blending                                 ║
@@ -24,6 +30,11 @@
 // ║  15. Distortion-free displacement     (Zirr & Ritschel 2019 UV correction)   ║
 // ║  16. Enhanced parallax occlusion mapping (POM refinement, self-shadow,       ║
 // ║                                          cone stepping, quadtree, SGF)       ║
+// ║  17. Stochastic alpha transparency    (stochastic alpha test, shadow alpha,  ║
+// ║                                       improved A2C — uses §1.12 IS-FAST)     ║
+// ║  18. Temporal stability               (variance-guided accumulation,         ║
+// ║                                       neighborhood clamping, disocclusion,   ║
+// ║                                       adaptive blend — extends §1.10/§1.9)   ║
 // ╠══════════════════════════════════════════════════════════════════════════════╣
 // ║  PART II — CHARACTER IMPROVEMENTS                                            ║
 // ║  Eye shading, eyelid shadows, IBL occlusion and other character-specific     ║
@@ -1750,6 +1761,503 @@ float RoughnessParallaxCompensation(
 // system's capture and relighting pipeline.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 1.6i  Chebyshev Visibility Leak Test
+// ---------------------------------------------------------------------------
+// AC Shadows SIGGRAPH 2025:
+//   Probe-based GI systems suffer from light leaking — a probe on the
+//   other side of a thin wall can bleed light through because trilinear
+//   interpolation doesn't respect occlusion.  AC Shadows stores mean
+//   distance and mean distance² per probe direction and uses Chebyshev's
+//   inequality to estimate the probability that the surface is actually
+//   visible to the probe.
+//
+// How it works:
+//   Given a probe that stores (for each octahedral direction):
+//     • meanDist   — average traced distance to geometry
+//     • meanDistSq — average of (traced distance)²
+//   And the actual distance from probe to the shaded surface:
+//     • surfaceDist
+//
+//   Chebyshev's inequality gives an upper bound on the probability
+//   that a random value from the stored distribution exceeds surfaceDist:
+//     variance = meanDistSq - meanDist²
+//     P(x ≥ surfaceDist) ≤ variance / (variance + (surfaceDist - meanDist)²)
+//
+//   If surfaceDist ≤ meanDist, the surface is closer than the average
+//   geometry seen by the probe → definitely visible (return 1).
+//   Otherwise, the Chebyshev bound gives a soft occlusion weight.
+//
+// This is the same math used in Variance Shadow Maps (VSM) but applied
+// to probe visibility rather than light shadows.  It produces smooth
+// soft transitions instead of hard on/off leaks.
+//
+// RenoDX applicability:
+//   Games that use DDGI, RTXGI, or any probe system with visibility/
+//   distance storage can benefit.  Identify the probe sampling shader,
+//   extract the distance data the game already stores, and replace the
+//   weight computation with this Chebyshev test.
+//
+//   If the game's probes DON'T store distance data (many older games
+//   don't), this can't be used — but BackfaceProbeRejection (§1.6j)
+//   can still help.
+//
+// Parameters:
+//   meanDist     – mean traced distance stored in the probe for this direction
+//   meanDistSq   – mean of (distance²) stored in the probe
+//   surfaceDist  – actual distance from the probe to the shaded surface
+//   minVariance  – floor on variance to avoid numerical instability
+//                  (default 1e-4).  Higher = softer transitions.
+//   lightBleed   – clamp to reduce light bleeding at penumbra edges
+//                  (default 0.1).  The Chebyshev bound can still allow
+//                  some leaking; this clamp remaps [lightBleed, 1] → [0, 1].
+//
+// Returns:  visibility weight [0,1].  1 = fully visible, 0 = fully occluded.
+//           Multiply into the probe's interpolation weight.
+// ---------------------------------------------------------------------------
+float ChebyshevProbeVisibility(
+    float  meanDist,
+    float  meanDistSq,
+    float  surfaceDist,
+    float  minVariance = 1e-4,
+    float  lightBleed  = 0.1)
+{
+  // Surface is closer than mean — definitely visible
+  if (surfaceDist <= meanDist) return 1.0;
+
+  // Variance from the stored moments
+  float variance = max(meanDistSq - meanDist * meanDist, minVariance);
+
+  // Chebyshev upper bound: P(x >= d) <= variance / (variance + (d - mean)²)
+  float delta = surfaceDist - meanDist;
+  float pMax  = variance / (variance + delta * delta);
+
+  // Light bleed reduction: remap [lightBleed, 1] → [0, 1]
+  return saturate((pMax - lightBleed) / (1.0 - lightBleed));
+}
+
+// ---------------------------------------------------------------------------
+// 1.6j  Backface Probe Rejection
+// ---------------------------------------------------------------------------
+// AC Shadows SIGGRAPH 2025:
+//   When interpolating between surrounding probes, reject any probe that
+//   is behind the surface plane.  A probe behind a wall can only "see"
+//   the surface through the wall — its contribution is invalid.
+//
+// The test: if the vector from the surface to the probe points away
+// from the surface normal (dot < 0), the probe is on the wrong side.
+//
+// This is the simplest and most universally applicable leak-reduction
+// technique for ANY probe-based GI system.  It requires only:
+//   • Surface world position (always available)
+//   • Surface normal (always available)
+//   • Probe world position (must be extracted from the game's probe data)
+//
+// The sharpness parameter controls how quickly the rejection ramps.
+// A gradual falloff avoids hard popping when probes transition from
+// front to back as the camera moves.
+//
+// RenoDX applicability:
+//   Very high.  Works with any probe/SH system where you can identify
+//   the probe positions.  Many games store probe grid origins and spacing
+//   in constant buffers — intercept those to compute probe positions.
+//
+// Parameters:
+//   surfacePos  – world-space position of the shaded pixel
+//   surfaceN    – world-space surface normal (normalized)
+//   probePos    – world-space position of the probe being tested
+//   sharpness   – controls the rejection ramp (default 1.0)
+//                 0.5 = very gradual falloff (forgiving)
+//                 1.0 = standard (good default)
+//                 2.0 = aggressive rejection (may cause dark spots)
+//   bias        – small offset to prevent self-occlusion at exactly
+//                 coplanar positions (default 0.1, in world units)
+//
+// Returns:  weight [0,1].  1 = probe is in front, 0 = probe is behind.
+//           Multiply into the probe's interpolation weight.
+// ---------------------------------------------------------------------------
+float BackfaceProbeRejection(
+    float3 surfacePos,
+    float3 surfaceN,
+    float3 probePos,
+    float  sharpness = 1.0,
+    float  bias      = 0.1)
+{
+  float3 toProbe = probePos - surfacePos;
+  float  d       = dot(toProbe, surfaceN);
+
+  // Normalize by distance to make the test scale-independent,
+  // then apply bias and sharpness
+  float dist = length(toProbe) + 1e-6;
+  float cosAngle = d / dist;
+
+  return saturate((cosAngle + bias / dist) * sharpness + 0.5);
+}
+
+// ---------------------------------------------------------------------------
+// 1.6k  Irradiance Sharpening
+// ---------------------------------------------------------------------------
+// AC Shadows SIGGRAPH 2025:
+//   World-space hash probes accumulate irradiance over many frames via
+//   exponential moving average.  This produces smooth but often overly
+//   soft indirect lighting, washing out contact shadows and directional
+//   cues.  A detail-enhancement pass can recover local contrast.
+//
+// Many existing games also suffer from this problem — baked lightmaps
+// and probe irradiance tend to be low-frequency, making environments
+// look flat.  A simple contrast enhancement on the GI contribution
+// restores visual depth without changing the overall energy level.
+//
+// The technique:
+//   1. Compute the luminance (energy level) of the sampled irradiance
+//   2. Apply a contrast curve around the mean luminance
+//   3. Preserve the hue and overall energy — only local contrast changes
+//
+// Three variants are provided:
+//   (i)   Luminance contrast — enhances luminance range around mean
+//   (ii)  Directional sharpening — steepens the directional response
+//         by blending toward the dominant direction contribution
+//   (iii) Detail recovery — steepens contrast while preserving darks
+//
+// RenoDX applicability:
+//   Very high.  Pure ALU replacement in any GI sampling shader.  Works
+//   with SH probes, irradiance volumes, lightmaps, SSAO-tinted ambient.
+//   Identify the pixel shader where GI/ambient is applied and insert
+//   this after the probe sample, before it multiplies into the surface.
+//
+// Parameters:
+//   irradiance  – sampled GI / indirect diffuse (linear RGB)
+//   strength    – sharpening intensity [0 = off, 1 = strong]
+//                 (default 0.3).  Keep moderate to avoid artifacts.
+//   midPoint    – luminance pivot for contrast (default 0.0 = auto).
+//                 When 0, uses the irradiance's own luminance as pivot.
+//                 When set explicitly, e.g. 0.1, that becomes the pivot.
+//
+// Returns:  sharpened irradiance (linear RGB), energy-preserving.
+// ---------------------------------------------------------------------------
+
+// -- 1.6k-i.  Luminance Contrast Sharpening ----------------------------------
+// Enhances local contrast in the irradiance by pushing luminance values
+// away from a pivot point.  Bright areas get brighter, dark areas get
+// darker, but the overall energy is approximately preserved via the
+// ratio-based rescale.
+float3 IrradianceSharpen(
+    float3 irradiance,
+    float  strength = 0.3,
+    float  midPoint = 0.0)
+{
+  // BT.709 luminance
+  float lum = dot(irradiance, float3(0.2126, 0.7152, 0.0722));
+  if (lum < 1e-6) return irradiance;
+
+  // Auto-pivot: use the irradiance's own luminance
+  float pivot = (midPoint > 0.0) ? midPoint : lum;
+
+  // Contrast: push away from pivot
+  // sharpened = pivot + (lum - pivot) * (1 + strength)
+  float sharpenedLum = pivot + (lum - pivot) * (1.0 + strength);
+  sharpenedLum = max(sharpenedLum, 0.0);
+
+  // Ratio-based rescale preserves chrominance
+  return irradiance * (sharpenedLum / lum);
+}
+
+// -- 1.6k-ii.  Directional Irradiance Sharpening ------------------------------
+// When you have both the full irradiance AND the dominant-direction
+// irradiance (e.g. from an L1 SH evaluation in the normal direction vs.
+// the DC band), this variant sharpens by blending toward the directional
+// component — emphasizing the dominant light direction.
+//
+// Parameters:
+//   irradiance     – full sampled irradiance (e.g. L2 SH eval)
+//   directional    – irradiance from the dominant direction only
+//                    (e.g. the L1 band contribution, or a single
+//                    probe evaluated in the light direction)
+//   strength       – blend toward directional [0,1] (default 0.3)
+//
+// Returns:  sharpened irradiance biased toward dominant direction.
+float3 IrradianceSharpenDirectional(
+    float3 irradiance,
+    float3 directional,
+    float  strength = 0.3)
+{
+  // Blend toward the directional component, which has more contrast
+  float3 sharpened = lerp(irradiance, directional, strength);
+
+  // Preserve overall energy: rescale to match input luminance
+  float lumIn  = dot(irradiance, float3(0.2126, 0.7152, 0.0722));
+  float lumOut = dot(sharpened,  float3(0.2126, 0.7152, 0.0722));
+
+  return (lumOut > 1e-6) ? sharpened * (lumIn / lumOut) : irradiance;
+}
+
+// -- 1.6k-iii.  Detail Recovery -----------------------------------------------
+// Applies a soft contrast curve that enhances detail in mid-range
+// irradiance without crushing blacks.  Uses a power curve centered
+// on the mean, with dark-end protection.
+//
+// Parameters:
+//   irradiance  – sampled GI (linear RGB)
+//   strength    – detail recovery intensity [0,1] (default 0.3)
+//   darkGuard   – luminance below which sharpening is suppressed
+//                 (default 0.01).  Prevents noise amplification in darks.
+//
+// Returns:  detail-enhanced irradiance (linear RGB).
+float3 IrradianceDetailRecover(
+    float3 irradiance,
+    float  strength  = 0.3,
+    float  darkGuard = 0.01)
+{
+  float lum = dot(irradiance, float3(0.2126, 0.7152, 0.0722));
+  if (lum < 1e-6) return irradiance;
+
+  // Suppress enhancement in very dark areas
+  float guard = smoothstep(0.0, darkGuard, lum);
+
+  // Power-curve contrast: lum^(1 / (1 + strength))
+  // This is > 1 for dark values and < 1 for bright values relative to 1.0,
+  // but we apply it as a ratio so it enhances contrast around current lum.
+  float exponent    = 1.0 / (1.0 + strength * guard);
+  float enhanced    = pow(lum, exponent);
+  float scaleFactor = enhanced / lum;
+
+  return irradiance * scaleFactor;
+}
+
+// ---------------------------------------------------------------------------
+// 1.6l  Screen-Space Global Illumination Approximation (SSGI)
+// ---------------------------------------------------------------------------
+// Approximates one-bounce indirect diffuse lighting using screen-space
+// data (depth buffer + normal G-buffer + color buffer).  This achieves
+// a similar goal to AC Shadows' probe-based GI — color-bleeding and
+// indirect illumination — but using only data available in any deferred
+// renderer's G-buffer, making it viable for RenoDX injection.
+//
+// How it works:
+//   1. From the shaded pixel, march short rays in the hemisphere above
+//      the surface normal through screen space
+//   2. At each step, read the depth buffer to check for intersection
+//   3. When a hit is found, read the color buffer at that location —
+//      this is the "bounced" radiance from that surface
+//   4. Weight the contribution by the cosine of the angle between
+//      the surface normal and the ray direction (Lambert)
+//   5. Accumulate and average across all rays
+//
+// This is essentially a screen-space radiosity gather — the same idea
+// behind SSAO but instead of just testing occlusion, we read the color
+// at the hit point to get colored indirect light.
+//
+// Limitations:
+//   • Only captures bounces from visible surfaces (screen-space only)
+//   • No contribution from off-screen or occluded geometry
+//   • Quality depends on depth buffer precision and G-buffer availability
+//   • Noisy with few samples — needs temporal accumulation or denoising
+//
+// RenoDX applicability:
+//   Medium.  Requires injecting a compute pass via RenderPass that reads
+//   the depth, normal, and color buffers as SRVs and writes to an
+//   injected UAV.  The result is then composited in the lighting shader.
+//   Per-game effort: identify G-buffer layout and lighting shader.
+//
+// NOTE: This function performs the per-pixel gather.  It should be called
+// from a compute shader dispatched after the G-buffer is populated and
+// before final lighting.  The sample directions should be pre-generated
+// (e.g. cosine-weighted hemisphere via golden-spiral, like §1.9f).
+//
+// Parameters:
+//   depthTex       – depth buffer (Texture2D<float>)
+//   normalTex      – world-space normal G-buffer (Texture2D<float4>)
+//                    .xyz = normal, .w unused
+//   colorTex       – scene color after direct lighting (Texture2D<float4>)
+//   pointSampler   – point-clamp sampler for depth/normal reads
+//   screenUV       – current pixel's screen UV [0,1]²
+//   surfaceN       – surface normal at this pixel (normalized, world space)
+//   viewDepth      – linear view-space depth of this pixel
+//   invProj        – inverse projection matrix (for UV+depth → view pos)
+//   screenSize     – render target dimensions (width, height)
+//   rayCount       – number of hemisphere rays to cast (default 8)
+//                    Higher = better quality but more texture reads.
+//                    8–16 is a good range for real-time use.
+//   rayLength      – maximum screen-space ray length in UV units
+//                    (default 0.05).  Controls how far bounces reach.
+//   raySteps       – steps per ray march (default 4)
+//   thickness      – depth comparison threshold for hit detection
+//                    (default 0.02, in view-space units)
+//   temporalOffset – per-frame jitter [0,1] for temporal noise rotation
+//                    (default 0.0).  Feed (frameIndex % 64) / 64.0.
+//   reversedZ      – true if depth buffer is reversed-Z (default true)
+//
+// Returns:  indirect diffuse radiance (linear RGB).  Add to the pixel's
+//           ambient / indirect diffuse contribution, scaled by albedo.
+// ---------------------------------------------------------------------------
+float3 ScreenSpaceGI(
+    Texture2D<float>  depthTex,
+    Texture2D<float4> normalTex,
+    Texture2D<float4> colorTex,
+    SamplerState      pointSampler,
+    float2            screenUV,
+    float3            surfaceN,
+    float             viewDepth,
+    float4x4          invProj,
+    float2            screenSize,
+    uint              rayCount       = 8,
+    float             rayLength      = 0.05,
+    uint              raySteps       = 4,
+    float             thickness      = 0.02,
+    float             temporalOffset = 0.0,
+    bool              reversedZ      = true)
+{
+  float3 giAccum = 0.0;
+  float  weightSum = 0.0;
+
+  // Golden angle for well-distributed ray directions
+  static const float GOLDEN_ANGLE = 2.39996323;
+
+  for (uint i = 0; i < rayCount; i++)
+  {
+    // Generate a ray direction in the hemisphere above surfaceN
+    // Using golden-spiral distribution with temporal jitter
+    float fi = (float)i + temporalOffset;
+    float angle = fi * GOLDEN_ANGLE;
+    float radius = sqrt((fi + 0.5) / (float)rayCount)  // cosine-weighted
+                 * rayLength;
+
+    float2 rayDir = float2(cos(angle), sin(angle)) * radius;
+
+    // March along the ray in screen space
+    float3 hitColor = 0.0;
+    bool   hit      = false;
+
+    for (uint s = 1; s <= raySteps; s++)
+    {
+      float t = (float)s / (float)raySteps;
+      float2 sampleUV = screenUV + rayDir * t;
+
+      // Out-of-bounds check
+      if (any(sampleUV < 0.0) || any(sampleUV > 1.0)) break;
+
+      // Sample depth at this screen location
+      float sampledDepth = depthTex.SampleLevel(pointSampler, sampleUV, 0);
+
+      // Convert sampled depth to linear view depth
+      float4 clipPos    = float4(sampleUV * 2.0 - 1.0, sampledDepth, 1.0);
+      clipPos.y = -clipPos.y;  // D3D UV convention
+      float4 viewPos    = mul(invProj, clipPos);
+      float  sampleViewDepth = viewPos.z / viewPos.w;
+
+      if (reversedZ) sampleViewDepth = -sampleViewDepth;
+
+      // Hit test: the sample is closer than our pixel, within thickness
+      float depthDelta = viewDepth - sampleViewDepth;
+      if (depthDelta > 0.0 && depthDelta < thickness)
+      {
+        hitColor = colorTex.SampleLevel(pointSampler, sampleUV, 0).rgb;
+
+        // Read the normal at hit point for cosine weighting
+        float3 hitN = normalTex.SampleLevel(pointSampler, sampleUV, 0).xyz;
+        hitN = normalize(hitN * 2.0 - 1.0);  // Unpack if [0,1] encoded
+
+        // Cosine weight: how much the hit surface faces back toward us
+        float2 hitToCenter = screenUV - sampleUV;
+        float  cosWeight   = saturate(dot(surfaceN, float3(hitToCenter, 0.01)));
+        cosWeight = max(cosWeight, 0.1);  // Minimum contribution
+
+        giAccum   += hitColor * cosWeight;
+        weightSum += cosWeight;
+        hit = true;
+        break;  // First hit per ray is sufficient
+      }
+    }
+  }
+
+  return (weightSum > 0.0) ? giAccum / weightSum : 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// 1.6l′  Screen-Space GI — Simplified (no normal buffer required)
+// ---------------------------------------------------------------------------
+// Lighter variant for games where the normal G-buffer is not accessible
+// or has an unknown encoding.  Uses only depth + color buffers.
+//
+// Instead of cosine-weighting by the hit normal, uses a simple distance-
+// based falloff assuming Lambertian response.  Less accurate but still
+// captures color bleeding effectively.
+//
+// Parameters:
+//   depthTex       – depth buffer
+//   colorTex       – scene color after direct lighting
+//   pointSampler   – point-clamp sampler
+//   screenUV       – current pixel's screen UV
+//   viewDepth      – linear view depth of this pixel
+//   invProj        – inverse projection matrix
+//   rayCount       – hemisphere rays (default 8)
+//   rayLength      – max screen-space ray length in UV (default 0.05)
+//   raySteps       – steps per ray (default 4)
+//   thickness      – depth hit threshold (default 0.02)
+//   temporalOffset – per-frame jitter [0,1] (default 0.0)
+//   reversedZ      – reversed-Z depth (default true)
+//
+// Returns:  approximate indirect diffuse (linear RGB).
+// ---------------------------------------------------------------------------
+float3 ScreenSpaceGISimple(
+    Texture2D<float>  depthTex,
+    Texture2D<float4> colorTex,
+    SamplerState      pointSampler,
+    float2            screenUV,
+    float             viewDepth,
+    float4x4          invProj,
+    uint              rayCount       = 8,
+    float             rayLength      = 0.05,
+    uint              raySteps       = 4,
+    float             thickness      = 0.02,
+    float             temporalOffset = 0.0,
+    bool              reversedZ      = true)
+{
+  float3 giAccum = 0.0;
+  uint   hitCount = 0;
+
+  static const float GOLDEN_ANGLE = 2.39996323;
+
+  for (uint i = 0; i < rayCount; i++)
+  {
+    float fi = (float)i + temporalOffset;
+    float angle = fi * GOLDEN_ANGLE;
+    float radius = sqrt((fi + 0.5) / (float)rayCount) * rayLength;
+    float2 rayDir = float2(cos(angle), sin(angle)) * radius;
+
+    for (uint s = 1; s <= raySteps; s++)
+    {
+      float t = (float)s / (float)raySteps;
+      float2 sampleUV = screenUV + rayDir * t;
+
+      if (any(sampleUV < 0.0) || any(sampleUV > 1.0)) break;
+
+      float sampledDepth = depthTex.SampleLevel(pointSampler, sampleUV, 0);
+
+      float4 clipPos = float4(sampleUV * 2.0 - 1.0, sampledDepth, 1.0);
+      clipPos.y = -clipPos.y;
+      float4 viewPos = mul(invProj, clipPos);
+      float  sampleViewDepth = viewPos.z / viewPos.w;
+
+      if (reversedZ) sampleViewDepth = -sampleViewDepth;
+
+      float depthDelta = viewDepth - sampleViewDepth;
+      if (depthDelta > 0.0 && depthDelta < thickness)
+      {
+        float3 hitColor = colorTex.SampleLevel(pointSampler, sampleUV, 0).rgb;
+
+        // Distance-based falloff: closer hits contribute more
+        float distFactor = 1.0 - t;
+        giAccum  += hitColor * distFactor;
+        hitCount += 1;
+        break;
+      }
+    }
+  }
+
+  return (hitCount > 0) ? giAccum / (float)hitCount : 0.0;
+}
+
 // ============================================================================
 // 1.7  Atmospheric Scattering Helpers
 // ----------------------------------------------------------------------------
@@ -2719,6 +3227,318 @@ float SpecularOcclusionFromAO(float NdotV, float ao, float roughness) {
   return saturate(pow(NdotV + ao, exp2(-16.0 * roughness - 1.0)) - 1.0 + ao);
 }
 
+// ---------------------------------------------------------------------------
+// 1.9f  Screen-Space Bent Normal Computation
+// ---------------------------------------------------------------------------
+// Inspired by "Ray Tracing the World of Assassin's Creed Shadows"
+// (SIGGRAPH 2025).
+//
+// Computes a bent normal AND AO simultaneously from the depth + normal
+// G-buffers by sampling the hemisphere around each pixel.  This is the
+// runtime equivalent of a baked bent normal map — producing the data
+// that §1.9a–d consume.
+//
+// Existing §1.9a–d assume the bent normal is already available (from a
+// baked map or using the surface normal as proxy).  This function
+// PRODUCES the bent normal at runtime in screen space, capturing
+// scene-scale occlusion (walls, furniture, terrain) that baked maps
+// or surface-normal proxies cannot represent.
+//
+// The algorithm is essentially GTAO/HBAO with an extra accumulator:
+// alongside the per-sample occlusion test, each unoccluded sample
+// direction is accumulated and averaged to yield the bent normal.
+// Cost is near-zero on top of an existing AO pass — just one extra
+// float3 accumulator.
+//
+// The output bent normal and AO can then be passed directly to:
+//   • §1.9a/b  BentNormalShadow      → direct light occlusion
+//   • §1.9d    BentNormalSpecularOcclusion → specular IBL occlusion
+//   • §1.9g    BentNormalIndirectDiffuse   → redirected indirect sampling
+//   • §1.9h    CosineWeightedSpecularOcclusion → improved specular occlusion
+//
+// REQUIREMENTS:
+//   • Depth buffer (Texture2D<float>)      — always available
+//   • G-buffer normals (Texture2D<float4>) — identify in RenderDoc
+//   • Screen-space UV and texel size
+//
+// Parameters:
+//   depthBuffer    – depth SRV (hardware depth, reversed-Z assumed)
+//   normalBuffer   – G-buffer world-space normals SRV
+//   pointSampler   – point-clamp sampler
+//   pixelUV        – current pixel UV [0,1]²
+//   texelSize      – float2(1.0/width, 1.0/height)
+//   projParams     – float4(near, far, aspect, fovScale) for depth
+//                    linearisation and view-space reconstruction
+//   sampleCount    – number of hemisphere directions to test (default 16).
+//                    More = better quality but more texture reads.
+//   sampleRadius   – maximum search radius in UV space (default 0.03).
+//                    Controls the spatial scale of occlusion captured.
+//   depthBias      – minimum depth difference to count as an occluder
+//                    (default 0.0001).  Prevents self-occlusion.
+//   maxDepthDiff   – maximum depth difference before a sample is
+//                    considered a separate surface (default 0.05).
+//                    Prevents distant background from occluding.
+//   frameIndex     – current frame counter for temporal jitter rotation.
+//
+// Outputs via inout:
+//   outBentNormal  – average unoccluded direction (normalised, world space)
+//   outAO          – ambient occlusion [0 = fully occluded, 1 = unoccluded]
+// ---------------------------------------------------------------------------
+void ComputeScreenSpaceBentNormal(
+    Texture2D<float>  depthBuffer,
+    Texture2D<float4> normalBuffer,
+    SamplerState      pointSampler,
+    float2            pixelUV,
+    float2            texelSize,
+    float4            projParams,
+    int               sampleCount,
+    float             sampleRadius,
+    float             depthBias,
+    float             maxDepthDiff,
+    uint              frameIndex,
+    inout float3      outBentNormal,
+    inout float       outAO)
+{
+  float  centerDepth = depthBuffer.SampleLevel(pointSampler, pixelUV, 0);
+  float3 centerN     = normalize(normalBuffer.SampleLevel(pointSampler, pixelUV, 0).xyz);
+
+  // Linearise center depth (reversed-Z: near=1, far=0).
+  float linearCenter = projParams.x * projParams.y
+                     / (projParams.y - centerDepth * (projParams.y - projParams.x));
+
+  float3 bentAccum = 0.0;
+  float  occluded  = 0.0;
+
+  // Golden angle rotation for well-distributed samples.
+  float goldenAngle = 2.39996323;
+  // Per-frame jitter to enable temporal accumulation.
+  float jitter = frac(0.6180339887 * (float)frameIndex);
+
+  for (int i = 0; i < sampleCount; i++) {
+    // Distribute samples via golden spiral on the hemisphere.
+    float fi     = (float)i + 0.5;
+    float angle  = fi * goldenAngle + jitter * 6.28318530;
+    float radius = (fi / (float)sampleCount) * sampleRadius;
+
+    float2 offset   = float2(cos(angle), sin(angle)) * radius;
+    float2 sampleUV = pixelUV + offset;
+
+    // Skip out-of-bounds.
+    if (any(sampleUV < 0.0) || any(sampleUV > 1.0)) continue;
+
+    float sampleDepth = depthBuffer.SampleLevel(pointSampler, sampleUV, 0);
+
+    // Linearise sample depth.
+    float linearSample = projParams.x * projParams.y
+                       / (projParams.y - sampleDepth * (projParams.y - projParams.x));
+
+    float depthDiff = linearCenter - linearSample;  // positive = sample is closer
+
+    // Build a direction from center to sample in view-aligned space.
+    // Approximate: treat UV offset as proportional to view-space XY.
+    float3 sampleDir = normalize(float3(offset / texelSize * 0.001, -depthDiff));
+
+    // Project onto hemisphere: only consider directions in the normal's hemisphere.
+    float NdotS = dot(centerN, sampleDir);
+    if (NdotS < 0.0) {
+      sampleDir = sampleDir - 2.0 * NdotS * centerN;
+      NdotS = -NdotS;
+    }
+
+    // Occlusion test: sample is an occluder if it's closer to the camera
+    // AND within the valid depth range.
+    bool isOccluder = (depthDiff > depthBias) && (depthDiff < maxDepthDiff);
+
+    if (isOccluder) {
+      occluded += 1.0;
+    } else {
+      // Accumulate unoccluded direction (cosine-weighted by hemisphere alignment).
+      bentAccum += sampleDir * NdotS;
+    }
+  }
+
+  float totalSamples = (float)sampleCount;
+  outAO = 1.0 - (occluded / totalSamples);
+
+  // Normalise bent accumulator.  Fall back to surface normal if all
+  // samples were occluded or the accumulator is near zero.
+  float bentLen = length(bentAccum);
+  outBentNormal = (bentLen > 1e-6) ? (bentAccum / bentLen) : centerN;
+}
+
+// Convenience overload with common defaults.
+void ComputeScreenSpaceBentNormal(
+    Texture2D<float>  depthBuffer,
+    Texture2D<float4> normalBuffer,
+    SamplerState      pointSampler,
+    float2            pixelUV,
+    float2            texelSize,
+    float4            projParams,
+    uint              frameIndex,
+    inout float3      outBentNormal,
+    inout float       outAO)
+{
+  ComputeScreenSpaceBentNormal(
+    depthBuffer, normalBuffer, pointSampler,
+    pixelUV, texelSize, projParams,
+    16,       // sampleCount
+    0.03,     // sampleRadius
+    0.0001,   // depthBias
+    0.05,     // maxDepthDiff
+    frameIndex,
+    outBentNormal, outAO);
+}
+
+// ---------------------------------------------------------------------------
+// 1.9g  Bent Normal Indirect Diffuse Redirection
+// ---------------------------------------------------------------------------
+// Inspired by "Ray Tracing the World of Assassin's Creed Shadows"
+// (SIGGRAPH 2025).
+//
+// Uses a screen-space bent normal (from §1.9f or a baked source) to
+// REDIRECT the indirect diffuse probe/cubemap lookup direction instead
+// of just attenuating it.
+//
+// Standard AO workflow:
+//   indirectDiffuse = probe.Sample(surfaceNormal) * ao;
+//   → Correct brightness, WRONG direction.  A pixel in a corner gets
+//     dimmed sky light, but the sky sample direction is still straight
+//     up — it should be sampling toward the opening.
+//
+// AC Shadows workflow:
+//   indirectDiffuse = probe.Sample(bentNormal) * ao;
+//   → Correct brightness AND correct direction.  The probe is sampled
+//     from where light actually arrives, which can be a completely
+//     different color (e.g., warm wall bounce vs. cold sky).
+//
+// This function blends between the surface normal and the bent normal
+// for the probe lookup direction, controlled by strength and AO.
+// A partial blend is recommended — full redirection can look strange
+// in low-sample-count screen-space bent normals due to noise.
+//
+// Pairs naturally with:
+//   • §1.9f  ComputeScreenSpaceBentNormal → produces the bent normal
+//   • §1.2a/b  ParallaxCorrectBox/Sphere  → applied to the redirected dir
+//   • §1.2c  ProbeMipFromRoughness        → mip selection uses roughness
+//   • §1.6f  SimpleAmbientBounce          → bounce term for the redirected
+//                                           indirect diffuse
+//
+// Parameters:
+//   surfaceNormal – shading normal (normalized)
+//   bentNormal    – average unoccluded direction (normalized), from §1.9f
+//                   or a baked bent normal map
+//   ao            – ambient occlusion [0,1]
+//   strength      – blend toward bent normal [0,1] (default 0.7)
+//                   0 = always use surface normal (standard AO)
+//                   1 = always use bent normal (full redirection)
+//                   0.5–0.8 is recommended for screen-space bent normals
+//                   to mask temporal noise.
+//
+// Returns:  redirected probe lookup direction (normalised).
+//
+// Usage:
+//   float3 bentN; float ao;
+//   renodx::rendering::ComputeScreenSpaceBentNormal(
+//       depthBuf, normalBuf, samp, uv, texelSize, proj, frame, bentN, ao);
+//
+//   float3 probeDir = renodx::rendering::BentNormalIndirectDiffuse(
+//       surfaceNormal, bentN, ao);
+//   float3 indirect = probe.SampleLevel(samp, probeDir, maxMip).rgb * ao;
+// ---------------------------------------------------------------------------
+float3 BentNormalIndirectDiffuse(
+    float3 surfaceNormal,
+    float3 bentNormal,
+    float  ao,
+    float  strength = 0.7)
+{
+  // Scale redirection by AO: fully unoccluded pixels don't need
+  // redirection (bent normal ≈ surface normal anyway).  Only occluded
+  // pixels benefit from the directional shift.
+  float blendFactor = strength * (1.0 - saturate(ao));
+
+  float3 redirected = normalize(lerp(surfaceNormal, bentNormal, blendFactor));
+  return redirected;
+}
+
+// ---------------------------------------------------------------------------
+// 1.9h  Cosine-Weighted Specular Occlusion
+// ---------------------------------------------------------------------------
+// Inspired by "Ray Tracing the World of Assassin's Creed Shadows"
+// (SIGGRAPH 2025).
+//
+// An improved specular occlusion formula that accounts for the angular
+// relationship between the bent normal, reflection vector, AND the GGX
+// specular lobe width simultaneously — with cosine weighting for
+// energy-correct attenuation.
+//
+// Compared to §1.9d (BentNormalSpecularOcclusion), which uses a simple
+// threshold-based cone test:
+//   • This version computes the OVERLAP between the visibility cone
+//     (defined by bent normal + AO) and the specular lobe (defined by
+//     reflection vector + roughness).
+//   • Cosine weighting ensures directions closer to the bent normal
+//     (where more light arrives) contribute more.
+//   • The roughness-dependent transition means smooth surfaces get
+//     sharper occlusion (narrow lobe, easy to fully occlude) while
+//     rough surfaces get softer occlusion (wide lobe, harder to
+//     fully block).
+//
+// Pairs with:
+//   • §1.9f  ComputeScreenSpaceBentNormal → runtime bent normal source
+//   • §1.9d  BentNormalSpecularOcclusion  → simpler alternative
+//   • §1.9e  SpecularOcclusionFromAO      → fallback when no bent normal
+//   • §1.6g  HorizonOcclusion             → complementary vertex-normal-based
+//                                           occlusion (use both for best results)
+//
+// Parameters:
+//   bentNormal – average unoccluded direction (normalised)
+//   R          – reflection direction (normalised)
+//   ao         – ambient occlusion [0,1]
+//   roughness  – perceptual roughness [0,1]
+//
+// Returns:  specular occlusion [0,1], multiply into specular IBL.
+//
+// Usage:
+//   float specOcc = renodx::rendering::CosineWeightedSpecularOcclusion(
+//       bentNormal, R, ao, roughness);
+//   specularIBL *= specOcc;
+// ---------------------------------------------------------------------------
+float CosineWeightedSpecularOcclusion(
+    float3 bentNormal,
+    float3 R,
+    float  ao,
+    float  roughness)
+{
+  float aoClamped = saturate(ao);
+
+  // Visibility cone half-angle from AO.
+  float coneAngle = acos(saturate(1.0 - aoClamped));
+
+  // Angle between bent normal and reflection vector.
+  float bentToR = acos(clamp(dot(bentNormal, R), -1.0, 1.0));
+
+  // GGX specular lobe half-angle.
+  // For a GGX NDF with roughness α, the half-angle containing ~80% of
+  // the energy is approximately atan(α²).  We use α = roughness² (the
+  // standard perceptual→linear conversion).
+  float alpha = roughness * roughness;
+  float lobeHalfAngle = atan(alpha * 0.5 + 1e-5);
+
+  // Overlap: what fraction of the specular lobe falls inside the
+  // visibility cone.  Mapped via smoothstep for a soft transition.
+  float overlap = smoothstep(0.0, 2.0 * lobeHalfAngle,
+                             coneAngle - bentToR + lobeHalfAngle);
+
+  // Cosine weight: directions aligned with the bent normal carry more
+  // energy.  At high roughness the lobe is wide, so we relax this
+  // weighting — the specular integrates over a broad solid angle and
+  // partial occlusion matters less.
+  float cosWeight = saturate(dot(bentNormal, R));
+  cosWeight = lerp(cosWeight, 1.0, saturate(roughness));
+
+  return overlap * cosWeight;
+}
+
 // ============================================================================
 // 1.10  Screen-Space Shadow Depth-Bias Micro Detail
 // ----------------------------------------------------------------------------
@@ -3448,6 +4268,750 @@ float DepthBiasMicroDetailCombined(
     existingShadow, depthTexture, normalBuffer, pointSampler,
     pixelUV, rayDirUV, originDepth, originAO, texelSize, geometricN,
     heightScale, stepCount, stepSize, DefaultDepthBiasParams());
+}
+
+// ---------------------------------------------------------------------------
+// 1.10k  Shadow Visibility Bitmap
+// ---------------------------------------------------------------------------
+// Inspired by "Ray Tracing the World of Assassin's Creed Shadows"
+// (SIGGRAPH 2025).  Packs per-pixel shadow results for up to 8 lights
+// into a single uint32 bitmap, enabling:
+//   • Multi-light shadow tracking in ONE R32_UINT texture
+//   • Per-light, per-pixel temporal stability detection
+//   • Confidence-based sample allocation (stable → skip, unstable → resample)
+//
+// This is a pure data-structure technique — works with ANY shadow source:
+// shadow maps, screen-space ray marches (1.10e/f/j), PCSS, or RT shadows.
+//
+// Usage in a RenoDX render pass:
+//   1. After shadow compositing, call PackShadowBitmap() per pixel
+//   2. Next frame, read previous bitmap to detect per-light stability
+//   3. Use GetShadowConfidence() to skip stable pixels (save bandwidth)
+//   4. Combine with DepthBiasMicroDetailOverlay (1.10f) or Combined (1.10j)
+//      for adaptive quality: unstable regions get full micro-detail,
+//      stable regions reuse previous results.
+//
+// MAX_SHADOW_BITMAP_LIGHTS: up to 8 lights per pixel (8 bits per light
+// encoded in uint32).  Each bit represents shadow state for one light.
+// ---------------------------------------------------------------------------
+
+static const int MAX_SHADOW_BITMAP_LIGHTS = 8;
+
+// Packs up to MAX_SHADOW_BITMAP_LIGHTS shadow values into a single uint.
+// Each shadow value is binarised at the given threshold: below = shadowed (0),
+// above = lit (1).
+//
+// Parameters:
+//   shadowValues  – array of shadow factors [0,1] per light
+//   lightCount    – number of active lights (max MAX_SHADOW_BITMAP_LIGHTS)
+//   threshold     – binarisation threshold (default 0.5)
+//
+// Returns:  packed bitmap, bit N = shadow state of light N.
+uint PackShadowBitmap(float shadowValues[MAX_SHADOW_BITMAP_LIGHTS],
+                      int   lightCount,
+                      float threshold = 0.5)
+{
+  uint bitmap = 0u;
+  int  count  = min(lightCount, MAX_SHADOW_BITMAP_LIGHTS);
+  for (int i = 0; i < count; i++) {
+    if (shadowValues[i] >= threshold) {
+      bitmap |= (1u << (uint)i);
+    }
+  }
+  return bitmap;
+}
+
+// Convenience: pack a single light's shadow into an existing bitmap.
+uint SetShadowBit(uint existingBitmap, int lightIndex, float shadow,
+                  float threshold = 0.5)
+{
+  uint bit = (shadow >= threshold) ? 1u : 0u;
+  uint mask = 1u << (uint)lightIndex;
+  return (existingBitmap & ~mask) | (bit << (uint)lightIndex);
+}
+
+// Unpack a single light's shadow state from the bitmap.
+// Returns 0.0 (shadowed) or 1.0 (lit).
+float UnpackShadowBit(uint bitmap, int lightIndex)
+{
+  return (((bitmap >> (uint)lightIndex) & 1u) != 0u) ? 1.0 : 0.0;
+}
+
+// ---------------------------------------------------------------------------
+// 1.10l  Shadow Temporal Stability & Confidence
+// ---------------------------------------------------------------------------
+// Compares current and previous frame shadow bitmaps to determine
+// per-pixel, per-light stability.  The confidence output can be used to:
+//   • Skip shadow re-evaluation for stable pixels (performance)
+//   • Allocate more samples to unstable pixels (quality-where-needed)
+//   • Combine with 1.10e/f/j: run the full micro-detail ray march
+//     only on low-confidence pixels; reuse previous shadow on high.
+//
+// The stability counter saturates at maxStableFrames.  This prevents
+// integer overflow and provides a natural "cooldown" before a pixel
+// is considered fully stable.
+//
+// Implements the confidence-based sampling strategy from AC Shadows:
+// stable pixels receive zero new samples, newly unstable pixels get
+// full-quality re-evaluation.
+// ---------------------------------------------------------------------------
+
+struct ShadowConfidence {
+  float confidence;    // [0,1]  0 = just changed, 1 = fully stable
+  uint  changedMask;   // bitmask of lights that changed this frame
+  int   stableFrames;  // how many consecutive frames all lights are stable
+};
+
+// Compute per-pixel shadow confidence from current/previous bitmaps.
+//
+// Parameters:
+//   currentBitmap    – this frame's packed shadow bitmap (from 1.10k)
+//   previousBitmap   – last frame's packed shadow bitmap
+//   prevStableFrames – previous frame's stableFrames counter
+//   maxStableFrames  – saturation limit for frame counter (default 16)
+//
+// Returns:  ShadowConfidence with per-light change mask and overall confidence.
+ShadowConfidence GetShadowConfidence(
+    uint currentBitmap,
+    uint previousBitmap,
+    int  prevStableFrames,
+    int  maxStableFrames = 16)
+{
+  ShadowConfidence result;
+  result.changedMask = currentBitmap ^ previousBitmap;
+
+  if (result.changedMask == 0u) {
+    // All lights stable — increment counter.
+    result.stableFrames = min(prevStableFrames + 1, maxStableFrames);
+  } else {
+    // Something changed — reset.
+    result.stableFrames = 0;
+  }
+
+  result.confidence = saturate((float)result.stableFrames / (float)maxStableFrames);
+  return result;
+}
+
+// Returns true if a specific light changed shadow state between frames.
+bool DidLightShadowChange(uint changedMask, int lightIndex)
+{
+  return (changedMask & (1u << (uint)lightIndex)) != 0u;
+}
+
+// ---------------------------------------------------------------------------
+// 1.10m  Spatial Hash Shadow Denoiser
+// ---------------------------------------------------------------------------
+// Lightweight edge-aware spatial denoiser that groups pixels by a hash
+// of their geometric properties (depth, normal) and shares shadow data
+// within each group.
+//
+// Inspired by the spatial-hash denoiser from "Ray Tracing the World of
+// Assassin's Creed Shadows" (SIGGRAPH 2025), which replaces expensive
+// bilateral filters at roughly half the cost.
+//
+// Applicable to ANY noisy screen-space shadow signal:
+//   • Shadow map PCF / PCSS results
+//   • Screen-space shadow ray marches (1.10e/f/j)
+//   • RT shadow outputs
+//   • SSAO, screen-space reflections, or any per-pixel noisy signal
+//
+// Can be combined with the confidence system (1.10l): skip denoising
+// for high-confidence pixels, apply full denoising for low-confidence.
+//
+// Parameters:
+//   shadowBuffer   – noisy shadow input (Texture2D<float>)
+//   depthBuffer    – depth SRV
+//   normalBuffer   – G-buffer normals SRV
+//   pointSampler   – point-clamp sampler
+//   pixelUV        – current pixel UV [0,1]²
+//   texelSize      – float2(1.0/width, 1.0/height)
+//   kernelRadius   – spatial filter radius in pixels (default 2)
+//   depthWeight    – sensitivity to depth differences (default 1000.0)
+//   normalPower    – exponent for normal similarity (default 32.0)
+//
+// Returns:  denoised shadow value [0,1].
+// ---------------------------------------------------------------------------
+float SpatialHashShadowDenoise(
+    Texture2D<float>  shadowBuffer,
+    Texture2D<float>  depthBuffer,
+    Texture2D<float4> normalBuffer,
+    SamplerState      pointSampler,
+    float2            pixelUV,
+    float2            texelSize,
+    int               kernelRadius = 2,
+    float             depthWeight  = 1000.0,
+    float             normalPower  = 32.0)
+{
+  float  centerShadow = shadowBuffer.SampleLevel(pointSampler, pixelUV, 0);
+  float  centerDepth  = depthBuffer.SampleLevel(pointSampler, pixelUV, 0);
+  float3 centerN      = normalize(normalBuffer.SampleLevel(pointSampler, pixelUV, 0).xyz);
+
+  // Hash the center pixel's geometric properties for bucket comparison.
+  uint centerHash = HashPixelGeometry(centerDepth, centerN);
+
+  float weightedSum = centerShadow;
+  float totalWeight = 1.0;
+
+  for (int y = -kernelRadius; y <= kernelRadius; y++) {
+    for (int x = -kernelRadius; x <= kernelRadius; x++) {
+      if (x == 0 && y == 0) continue;
+
+      float2 sampleUV = pixelUV + float2((float)x, (float)y) * texelSize;
+
+      // Skip out-of-bounds.
+      if (any(sampleUV < 0.0) || any(sampleUV > 1.0)) continue;
+
+      float  sDepth  = depthBuffer.SampleLevel(pointSampler, sampleUV, 0);
+      float3 sNormal = normalize(normalBuffer.SampleLevel(pointSampler, sampleUV, 0).xyz);
+
+      // Hash-bucket fast reject: skip if different geometric group.
+      uint sHash = HashPixelGeometry(sDepth, sNormal);
+      if (sHash != centerHash) continue;
+
+      // Fine-grained similarity weights within the same bucket.
+      float dw = exp(-abs(sDepth - centerDepth) * depthWeight);
+      float nw = pow(max(dot(sNormal, centerN), 0.0), normalPower);
+      float w  = dw * nw;
+
+      float sShadow = shadowBuffer.SampleLevel(pointSampler, sampleUV, 0);
+      weightedSum += sShadow * w;
+      totalWeight += w;
+    }
+  }
+
+  return weightedSum / totalWeight;
+}
+
+// Spatial hash key: quantises depth and normal into a compact bucket ID.
+// Pixels in the same bucket are geometrically similar enough to share
+// shadow data safely.
+uint HashPixelGeometry(float depth, float3 normal)
+{
+  // Quantise depth to ~1024 levels.
+  uint dq = (uint)(saturate(depth) * 1024.0);
+
+  // Quantise normal to 16x16 octahedral bins.
+  uint2 nq = (uint2)(saturate(normal.xy * 0.5 + 0.5) * 16.0);
+
+  // Combine with large primes to spread hash distribution.
+  return dq ^ (nq.x * 73856093u) ^ (nq.y * 19349663u);
+}
+
+// ---------------------------------------------------------------------------
+// 1.10n  Confidence-Adaptive Shadow Pipeline
+// ---------------------------------------------------------------------------
+// Complete integration function that ties together:
+//   • Shadow visibility bitmap (1.10k)
+//   • Temporal confidence (1.10l)
+//   • Spatial hash denoising (1.10m)
+//   • Depth-bias micro detail overlay (1.10f) or combined (1.10j)
+//
+// This implements the core strategy from AC Shadows' hybrid shadow system
+// adapted for raster titles:
+//   1. Read previous frame's shadow bitmap to determine confidence.
+//   2. For HIGH-confidence pixels, reuse previous shadow (near-zero cost).
+//   3. For LOW-confidence pixels, compute full shadow with micro detail.
+//   4. Denoise the result with the spatial hash filter.
+//   5. Update the bitmap for next frame.
+//
+// This is the recommended entry point for combining AC Shadows techniques
+// with the existing depth-bias system (1.10a–j).  For games where only
+// a single directional light matters, set lightIndex = 0.
+//
+// Parameters:
+//   existingShadow      – the game's base shadow value for this light [0,1]
+//   prevShadowBitmap    – previous frame's packed bitmap (Texture2D<uint>)
+//   prevStableFrames    – previous frame's stability counter (Texture2D<int>)
+//   shadowBuffer        – noisy shadow texture for denoising (can be same
+//                         as the existing shadow source)
+//   depthTexture        – depth buffer SRV
+//   normalBuffer        – G-buffer normals SRV
+//   pointSampler        – point-clamp sampler
+//   pixelUV             – current pixel UV [0,1]²
+//   rayDirUV            – normalised direction toward light in UV space
+//   originDepth         – depth at current pixel
+//   texelSize           – float2(1.0/width, 1.0/height)
+//   lightIndex          – which light slot [0, MAX_SHADOW_BITMAP_LIGHTS)
+//   confidenceThreshold – above this confidence, skip re-evaluation
+//                         (default 0.7 = stable for ~11 frames)
+//   useDenoise          – enable spatial hash denoising (default true)
+//   useMicroDetail      – enable depth-bias micro detail (default true)
+//
+// Outputs via inout:
+//   outBitmap       – updated bitmap to write for next frame
+//   outStableFrames – updated stability counter for next frame
+//
+// Returns:  final shadow factor [0 = shadowed, 1 = lit].
+// ---------------------------------------------------------------------------
+float ConfidenceAdaptiveShadow(
+    float             existingShadow,
+    Texture2D<uint>   prevShadowBitmap,
+    Texture2D<int>    prevStableFrames,
+    Texture2D<float>  shadowBuffer,
+    Texture2D<float>  depthTexture,
+    Texture2D<float4> normalBuffer,
+    SamplerState      pointSampler,
+    float2            pixelUV,
+    float2            rayDirUV,
+    float             originDepth,
+    float2            texelSize,
+    int               lightIndex,
+    float             confidenceThreshold,
+    bool              useDenoise,
+    bool              useMicroDetail,
+    inout uint        outBitmap,
+    inout int         outStableFrames)
+{
+  // --- Read previous frame state ---
+  uint prevBitmap = prevShadowBitmap.SampleLevel(pointSampler, pixelUV, 0);
+  int  prevStable = prevStableFrames.SampleLevel(pointSampler, pixelUV, 0);
+
+  // --- Build current bitmap from existing shadow ---
+  uint currentBitmap = SetShadowBit(0u, lightIndex, existingShadow);
+
+  // --- Compute confidence ---
+  ShadowConfidence conf = GetShadowConfidence(
+    currentBitmap, prevBitmap, prevStable);
+
+  float shadow = existingShadow;
+
+  if (conf.confidence >= confidenceThreshold) {
+    // High confidence: reuse previous shadow — skip expensive work.
+    shadow = UnpackShadowBit(prevBitmap, lightIndex);
+  } else {
+    // Low confidence: apply full quality pipeline.
+
+    // Micro detail enhancement (1.10f).
+    if (useMicroDetail) {
+      shadow = DepthBiasMicroDetailOverlay(
+        shadow, depthTexture, pointSampler,
+        pixelUV, rayDirUV, originDepth);
+    }
+
+    // Spatial hash denoising (1.10m).
+    if (useDenoise) {
+      // We need to evaluate the denoiser on the shadow buffer, not on
+      // our locally computed value.  If the game writes shadow to a
+      // texture we can read, use that.  Otherwise this denoises the
+      // existing input.
+      float denoised = SpatialHashShadowDenoise(
+        shadowBuffer, depthTexture, normalBuffer,
+        pointSampler, pixelUV, texelSize);
+      // Blend denoised with micro-detail-enhanced shadow.
+      shadow = min(shadow, denoised);
+    }
+  }
+
+  // --- Update outputs for next frame ---
+  outBitmap       = SetShadowBit(currentBitmap, lightIndex, shadow);
+  outStableFrames = conf.stableFrames;
+
+  return shadow;
+}
+
+// Convenience overload with common defaults.
+float ConfidenceAdaptiveShadow(
+    float             existingShadow,
+    Texture2D<uint>   prevShadowBitmap,
+    Texture2D<int>    prevStableFrames,
+    Texture2D<float>  shadowBuffer,
+    Texture2D<float>  depthTexture,
+    Texture2D<float4> normalBuffer,
+    SamplerState      pointSampler,
+    float2            pixelUV,
+    float2            rayDirUV,
+    float             originDepth,
+    float2            texelSize,
+    int               lightIndex          = 0,
+    float             confidenceThreshold = 0.7,
+    bool              useDenoise          = true,
+    bool              useMicroDetail      = true)
+{
+  uint outBitmap       = 0u;
+  int  outStableFrames = 0;
+  return ConfidenceAdaptiveShadow(
+    existingShadow, prevShadowBitmap, prevStableFrames,
+    shadowBuffer, depthTexture, normalBuffer, pointSampler,
+    pixelUV, rayDirUV, originDepth, texelSize,
+    lightIndex, confidenceThreshold, useDenoise, useMicroDetail,
+    outBitmap, outStableFrames);
+}
+
+// ---------------------------------------------------------------------------
+// 1.10o  Oriented Depth Bias  (FFXVI Shadow Bias)
+// ---------------------------------------------------------------------------
+// Reference:
+//   "Shadow Techniques from Final Fantasy XVI", Square Enix (2023)
+//   Section 4.2 — Oriented Depth Bias  (Listing 7, Figures 19–20)
+//
+// PROBLEM:
+//   Hardware Depth Bias offsets the depth written to the shadow map by a
+//   fixed amount.  This reduces shadow acne (self-shadowing) but
+//   introduces Peter Panning (shadows detaching from casters) when the
+//   bias is too large.  Worse, because shadow map depth is NONLINEAR,
+//   a fixed bias grows in world-space as distance from the light
+//   increases, making it impossible to pick one value that works at all
+//   depths.  (See paper Figure 19.)
+//
+// FFXVI SOLUTION — Oriented Depth Bias:
+//   Shadow maps are generated WITHOUT hardware depth bias so that
+//   stored depths are as close to the real surface as possible.
+//   At shadow-testing time, a FIXED-MAGNITUDE linear-space bias is
+//   added to the tested depth, with its SIGN determined by the
+//   surface's orientation relative to the light:
+//
+//     • Facing the light (NdotL > 0) → bias TOWARD the light
+//       (subtract from depth → reduces self-shadow / acne)
+//     • Facing away from the light (NdotL ≤ 0) → bias AWAY from light
+//       (add to depth → reduces Peter Panning on back faces)
+//     • SSS materials → ALWAYS bias toward the light
+//       (removes self-shadow to allow subsurface scattering)
+//
+//   Because the bias is applied in LINEAR depth space (via DepthToViewZ
+//   / ViewZToDepth conversion), it remains uniform across all depth
+//   ranges, eliminating the nonlinearity problem entirely.
+//
+// PSEUDOCODE FROM PAPER (Listing 7):
+//
+//   float GetOrientedBias(float3 faceNormal, float3 lightDirection,
+//                         bool isSSS) {
+//     static float kOrientedBias = 0.2;  // cm — tunable per game
+//     float isFacingLight   = dot(faceNormal, lightDirection) > 0;
+//     bool moveTowardLight  = isSSS || isFacingLight;
+//     return moveTowardLight ? -kOrientedBias : kOrientedBias;
+//   }
+//
+//   float ComputeShadows(LightInfo lightInfo, float3 worldPos,
+//                        float3 faceNormal, bool isSSS) {
+//     float3 lightDir      = GetLightDirection(lightInfo, worldPos);
+//     float3 shadowCoord   = WorldToShadowmapCoord(lightInfo, worldPos);
+//     float  linearDepth   = DepthToViewZ(lightInfo, shadowCoord.z);
+//     float  linearBias    = GetOrientedBias(faceNormal, lightDir, isSSS);
+//     shadowCoord.z        = ViewZToDepth(lightInfo, linearDepth+linearBias);
+//     return PerformShadowmapTest(lightInfo, shadowCoord);
+//   }
+//
+// INTEGRATION PATHS:
+//
+//   Path A — Full FFXVI method (§1.10o-i + §1.10o-ii):
+//     Use GetOrientedBias() to get the linear-space bias, then apply it
+//     via ComputeShadowsOrientedBias() which handles the nonlinear
+//     depth conversion.  Requires the light's near/far planes or
+//     projection matrix to convert between view-Z and shadow depth.
+//
+//   Path B — Simplified comparison bias (§1.10o-iii):
+//     If you don't have access to depth linearisation parameters,
+//     OrientedDepthBiasValue() provides a slope-scaled bias in
+//     normalised depth space.  Less accurate than Path A but easier
+//     to inject.
+//
+//   Path C — World-space normal offset (§1.10o-iv):
+//     Standard normal-offset technique (à la Unity/UE).  Shifts the
+//     shadow lookup position along the surface normal before
+//     projection.  Useful when you control the lookup position.
+//
+//   Path D — Overlay on existing shadows:
+//     Pair with §1.10f DepthBiasMicroDetailOverlay (screen-space
+//     shadows) — oriented bias fixes shadow MAP quality while §1.10f
+//     fixes screen-space shadow quality.
+//
+// REQUIREMENTS:
+//   • Surface normal in world space (from G-buffer or forward PS)
+//   • Light direction (from CB — identify in RenderDoc)
+//   • For Path A: light near/far planes OR the projection matrix
+//   • For Path C: the light's view-projection matrix
+//
+// Parameters are tuned per game because they depend on:
+//   • World-space scale (meters vs centimeters vs arbitrary units)
+//   • Shadow map resolution (higher res → smaller bias needed)
+//   • Cascade split distances (far cascades need more bias)
+// ---------------------------------------------------------------------------
+
+// -- 1.10o-i.  GetOrientedBias  (FFXVI Listing 7 — faithful) -----------------
+//
+// Returns a FIXED-MAGNITUDE bias in linear depth units (e.g. centimeters)
+// whose SIGN depends on whether the surface faces the light.
+//
+// This is the core insight of the FFXVI paper: instead of a variable
+// bias that grows with angle, use a constant small bias and simply
+// flip its direction.  Facing-light surfaces get biased toward the
+// light (reducing acne), back-facing surfaces get biased away (reducing
+// Peter Panning).  SSS materials always bias toward the light to
+// eliminate self-shadow artifacts that would block scattering.
+//
+// Parameters:
+//   faceNormal      – surface normal (world space, normalized)
+//   lightDirection  – direction FROM surface TO light (normalized)
+//   isSSS           – true for subsurface scattering materials
+//   kOrientedBias   – bias magnitude in world/linear units (default 0.2)
+//                     The paper uses 0.2 cm.  Scale to match your game's
+//                     world units (e.g. if 1 unit = 1 meter, use 0.002).
+//
+// Returns:  signed linear-space bias.
+//   Negative = toward light (subtract from depth → receiver moves closer).
+//   Positive = away from light (add to depth → receiver moves farther).
+// ---------------------------------------------------------------------------
+float GetOrientedBias(
+    float3 faceNormal,
+    float3 lightDirection,
+    bool   isSSS,
+    float  kOrientedBias = 0.2)
+{
+  float isFacingLight  = dot(faceNormal, lightDirection) > 0.0;
+  bool moveTowardLight = isSSS || isFacingLight;
+  return moveTowardLight ? -kOrientedBias : kOrientedBias;
+}
+
+// -- 1.10o-ii.  ComputeShadowsOrientedBias  (FFXVI Listing 7) ----------------
+//
+// Complete shadow evaluation with oriented depth bias applied in LINEAR
+// depth space, matching the FFXVI paper exactly.
+//
+// The key steps:
+//   1. Convert the shadow map's nonlinear depth to linear view-Z.
+//   2. Add the oriented bias (fixed magnitude, orientation-dependent sign).
+//   3. Convert back to nonlinear shadow map depth.
+//   4. Use the biased depth for the shadow map comparison.
+//
+// This ensures the bias is uniform across all depth ranges, unlike
+// hardware depth bias which grows nonlinearly with distance.
+//
+// The DepthToViewZ / ViewZToDepth conversions use the standard
+// perspective projection formulas:
+//   viewZ = (near * far) / (far - depth * (far - near))       [reversed-Z]
+//   depth = (far * (viewZ - near)) / (viewZ * (far - near))   [reversed-Z]
+//
+// For standard (non-reversed) Z, set reversedZ = false.
+//
+// Parameters:
+//   shadowCoordZ    – the depth value from the shadow map coordinate
+//                     (i.e. the fragment's depth in light clip space,
+//                     already divided by w, in [0,1])
+//   faceNormal      – surface normal (world space, normalized)
+//   lightDirection  – direction TO the light (normalized)
+//   isSSS           – true for subsurface scattering materials
+//   nearPlane       – light's near clip plane distance
+//   farPlane        – light's far clip plane distance
+//   kOrientedBias   – bias magnitude in linear units (default 0.2)
+//   reversedZ       – true if using reversed-Z depth (default true, the
+//                     DX12/Vulkan convention; most modern games use this)
+//
+// Returns:  biased shadow map depth for comparison.  Use as:
+//   float biasedZ = ComputeShadowsOrientedBias(...);
+//   float shadow = shadowMap.SampleCmpLevelZero(cmpSampler, uv, biasedZ);
+// ---------------------------------------------------------------------------
+float ComputeShadowsOrientedBias(
+    float  shadowCoordZ,
+    float3 faceNormal,
+    float3 lightDirection,
+    bool   isSSS,
+    float  nearPlane,
+    float  farPlane,
+    float  kOrientedBias = 0.2,
+    bool   reversedZ     = true)
+{
+  // Convert nonlinear shadow depth to linear view-Z.
+  float depthRange = farPlane - nearPlane;
+  float linearDepth;
+  if (reversedZ) {
+    // Reversed-Z: depth=1 at near, depth=0 at far.
+    linearDepth = (nearPlane * farPlane)
+                / (farPlane - shadowCoordZ * depthRange);
+  } else {
+    // Standard Z: depth=0 at near, depth=1 at far.
+    linearDepth = (nearPlane * farPlane)
+                / (farPlane - shadowCoordZ * depthRange);
+  }
+
+  // Apply oriented bias in linear space (constant world-space magnitude).
+  float linearBias = GetOrientedBias(
+      faceNormal, lightDirection, isSSS, kOrientedBias);
+  float biasedLinearDepth = linearDepth + linearBias;
+
+  // Convert back to nonlinear shadow map depth.
+  float biasedZ;
+  if (reversedZ) {
+    biasedZ = (farPlane * (biasedLinearDepth - nearPlane))
+            / (biasedLinearDepth * depthRange);
+    biasedZ = 1.0 - biasedZ;  // reversed-Z: flip
+  } else {
+    biasedZ = (farPlane * (biasedLinearDepth - nearPlane))
+            / (biasedLinearDepth * depthRange);
+  }
+
+  return saturate(biasedZ);
+}
+
+// -- 1.10o-iii.  Oriented Comparison Bias (slope-scaled, depth-space) ---------
+//
+// General-purpose slope-scaled depth bias for shadow comparison.
+// (NOT the FFXVI method — this is the standard NdotL-scaled approach
+// used by Unity/UE.  Provided for cases where linear depth conversion
+// parameters are unavailable.)
+//
+// Computes a depth-space bias value to add to the shadow map sample
+// BEFORE the depth comparison.  The bias scales inversely with NdotL.
+//
+// Parameters:
+//   NdotL          – dot(surfaceNormal, lightDir), clamped [0,1]
+//   baseBias       – minimum depth bias at NdotL=1 (default 0.0005)
+//   maxBias        – maximum depth bias at NdotL≈0 (default 0.005)
+//   slopeScale     – multiplier for the slope-dependent term (default 2.0)
+//
+// Returns:  scalar depth bias to ADD to the shadow map depth sample:
+//   float bias = OrientedDepthBiasValue(NdotL);
+//   float shadow = (shadowMapDepth + bias > fragmentLightDepth) ? 1.0 : 0.0;
+// ---------------------------------------------------------------------------
+float OrientedDepthBiasValue(
+    float NdotL,
+    float baseBias   = 0.0005,
+    float maxBias    = 0.005,
+    float slopeScale = 2.0)
+{
+  float cosAngle = max(abs(NdotL), 0.001);
+  float bias = baseBias + slopeScale * baseBias * (1.0 - cosAngle) / cosAngle;
+  return min(bias, maxBias);
+}
+
+// -- 1.10o-iv.  Normal Offset (world-space position shift) --------------------
+//
+// General-purpose normal-offset shadow bias (à la Unity/UE).
+// (NOT the FFXVI method.  The FFXVI technique operates in linear depth
+// space via §1.10o-i/ii above.)
+//
+// Returns a world-space offset vector to add to the fragment position
+// BEFORE projecting into light space for the shadow map lookup.
+// The offset pushes the lookup point along the surface normal, scaled
+// inversely by NdotL.
+//
+// Parameters:
+//   normalWS      – surface normal (world space, normalized)
+//   lightDir      – direction TO the light (normalized)
+//   normalBias    – world-space normal offset magnitude (default 0.02)
+//   slopeBias     – additional slope-scaled bias for grazing surfaces
+//                   (default 0.005)
+//   minNdotL      – NdotL floor to prevent extreme offsets at 90°
+//                   (default 0.01)
+//
+// Returns:  float3 world-space offset vector.  Apply as:
+//   float3 biasedWorldPos = worldPos + result;
+//   float4 lightClip = mul(lightViewProj, float4(biasedWorldPos, 1.0));
+//   float3 shadowUVZ = lightClip.xyz / lightClip.w;
+// ---------------------------------------------------------------------------
+float3 NormalOffsetShadowBias(
+    float3 normalWS,
+    float3 lightDir,
+    float  normalBias = 0.02,
+    float  slopeBias  = 0.005,
+    float  minNdotL   = 0.01)
+{
+  float NdotL = dot(normalWS, lightDir);
+  float cosAngle = max(abs(NdotL), minNdotL);
+  float sinAngle = sqrt(1.0 - cosAngle * cosAngle);
+
+  float3 normalOffset = normalWS * (normalBias / cosAngle);
+
+  float3 lightTangent = normalize(lightDir - normalWS * NdotL);
+  float3 slopeOffset  = lightTangent * (slopeBias * sinAngle / cosAngle);
+
+  return normalOffset + slopeOffset;
+}
+
+// Backward-compatible alias for existing code using the old name.
+float3 OrientedDepthBiasWorldOffset(
+    float3 normalWS,
+    float3 lightDir,
+    float  normalBias = 0.02,
+    float  slopeBias  = 0.005,
+    float  minNdotL   = 0.01)
+{
+  return NormalOffsetShadowBias(normalWS, lightDir,
+                                normalBias, slopeBias, minNdotL);
+}
+
+// -- 1.10o-v.  Per-Cascade Oriented Bias --------------------------------------
+//
+// Scales bias parameters by cascade extent so that near and far cascades
+// use appropriately-sized bias.
+//
+// Parameters:
+//   NdotL           – dot(surfaceNormal, lightDir), clamped [0,1]
+//   cascadeIndex    – which cascade level (0 = nearest)
+//   cascadeScales   – float4 of world-space extents per cascade
+//   baseNormalBias  – normal bias for cascade 0 (default 0.02)
+//   baseDepthBias   – depth comparison bias for cascade 0 (default 0.0005)
+//
+// Returns:  float2(normalBias, depthBias) scaled for the given cascade.
+// ---------------------------------------------------------------------------
+float2 OrientedDepthBiasPerCascade(
+    float  NdotL,
+    int    cascadeIndex,
+    float4 cascadeScales,
+    float  baseNormalBias = 0.02,
+    float  baseDepthBias  = 0.0005)
+{
+  float refScale = max(cascadeScales[0], 1e-6);
+  float thisScale = cascadeScales[min(cascadeIndex, 3)];
+  float scaleFactor = thisScale / refScale;
+
+  float normalBias = baseNormalBias * scaleFactor;
+  float depthBias  = OrientedDepthBiasValue(NdotL, baseDepthBias * scaleFactor,
+                                            baseDepthBias * scaleFactor * 10.0);
+  return float2(normalBias, depthBias);
+}
+
+// -- 1.10o-vi.  Complete Shadow Map Lookup with Normal Offset -----------------
+//
+// Convenience function combining world-space normal offset with shadow
+// map comparison.  Uses the general-purpose normal-offset approach
+// (§1.10o-iv), NOT the FFXVI linear-depth method.
+//
+// For the FFXVI approach, use ComputeShadowsOrientedBias() (§1.10o-ii)
+// with your own shadow map sampling.
+//
+// Parameters:
+//   shadowMap      – shadow map texture
+//   cmpSampler     – SamplerComparisonState (hardware PCF)
+//   worldPos       – world-space fragment position
+//   normalWS       – world-space surface normal (normalized)
+//   lightDir       – direction TO the light (normalized)
+//   lightViewProj  – light's view-projection matrix for this cascade
+//   normalBias     – world-space normal offset (default 0.02)
+//   slopeBias      – lateral slope bias (default 0.005)
+//   depthBias      – additional depth comparison bias (default 0.0005)
+//
+// Returns:  shadow factor [0 = shadowed, 1 = lit]
+// ---------------------------------------------------------------------------
+float ShadowMapOrientedBias(
+    Texture2D<float>        shadowMap,
+    SamplerComparisonState  cmpSampler,
+    float3                  worldPos,
+    float3                  normalWS,
+    float3                  lightDir,
+    float4x4                lightViewProj,
+    float                   normalBias = 0.02,
+    float                   slopeBias  = 0.005,
+    float                   depthBias  = 0.0005)
+{
+  float3 offset = NormalOffsetShadowBias(
+      normalWS, lightDir, normalBias, slopeBias);
+  float3 biasedPos = worldPos + offset;
+
+  float4 lightClip = mul(lightViewProj, float4(biasedPos, 1.0));
+  float3 shadowNDC = lightClip.xyz / lightClip.w;
+
+  float2 shadowUV = shadowNDC.xy * float2(0.5, -0.5) + 0.5;
+
+  float NdotL = saturate(dot(normalWS, lightDir));
+  float orientedBias = OrientedDepthBiasValue(NdotL,
+      depthBias, depthBias * 10.0);
+  float compareDepth = shadowNDC.z - orientedBias;
+
+  if (any(shadowUV < 0.0) || any(shadowUV > 1.0) ||
+      compareDepth < 0.0 || compareDepth > 1.0)
+    return 1.0;
+
+  return shadowMap.SampleCmpLevelZero(cmpSampler, shadowUV, compareDepth);
 }
 
 // ============================================================================
@@ -5341,17 +6905,19 @@ float NDFFilteringScalar(float3 halfVectorTS, float roughnessAlpha)
 // ---------------------------------------------------------------------------
 float2 NDFFilteringDeferred(float3 normalTS, float2 roughness2)
 {
-  // Use normal's projected coordinates as proxy for the half vector.
-  float2 normal2D = normalTS.xy;
-  float2 bounds   = fwidth(normal2D);
+  // Paper Eq. (13) / Listing 5: use full 3D derivatives of the normal.
+  // ||Δn̂⊥_u|| = ||Δn_u|| and ||Δn̂⊥_v|| = ||Δn_v|| (Eq. 12),
+  // so the trace of Σ_⊥ = σ²(||Δn_u||² + ||Δn_v||²).
+  float3 dndu = ddx(normalTS);
+  float3 dndv = ddy(normalTS);
 
-  static const float SIGMA2 = 0.15915494;
-  float2 kernelRoughness2 = 2.0 * SIGMA2 * (bounds * bounds);
+  static const float SIGMA2 = 0.15915494;  // 1/(2π)
+  float kernelRoughness2 = 2.0 * SIGMA2 * (dot(dndu, dndu) + dot(dndv, dndv));
 
   static const float KAPPA = 0.18;
-  float2 clampedKernelRoughness2 = min(kernelRoughness2, KAPPA);
+  float clampedKernel = min(kernelRoughness2, KAPPA);
 
-  float2 filteredRoughness2 = saturate(roughness2 + clampedKernelRoughness2);
+  float2 filteredRoughness2 = saturate(roughness2 + clampedKernel);
   return filteredRoughness2;
 }
 
@@ -5373,15 +6939,13 @@ float2 NDFFilteringDeferred(float3 normalTS, float2 roughness2)
 // ---------------------------------------------------------------------------
 float NDFFilteringDeferredWS(float3 normalWS, float roughnessAlpha)
 {
-  // Use xy of world-space normal as proxy.
-  // Less accurate than tangent-space but still catches the dominant
-  // source of specular aliasing (normal-map discontinuities and mesh
-  // curvature).
-  float2 normal2D = normalWS.xy;
-  float2 bounds   = fwidth(normal2D);
+  // Paper Eq. (13) / Listing 5: full 3D derivatives of the world-space normal.
+  // ā² = α² + min(2σ²(||Δn_u||² + ||Δn_v||²), κ)
+  float3 dndu = ddx(normalWS);
+  float3 dndv = ddy(normalWS);
 
-  static const float SIGMA2 = 0.15915494;
-  float kernelRoughness2 = 2.0 * SIGMA2 * max(dot(bounds, bounds), 0.0);
+  static const float SIGMA2 = 0.15915494;  // 1/(2π)
+  float kernelRoughness2 = 2.0 * SIGMA2 * (dot(dndu, dndu) + dot(dndv, dndv));
 
   static const float KAPPA = 0.18;
   float clampedKernel = min(kernelRoughness2, KAPPA);
@@ -7012,6 +8576,1186 @@ float2 IntervalMapping(
                                    RENODX_POM_LINEAR_STEPS_MAX);
   return IntervalMapping(heightMap, heightSampler, uv, viewDirTS,
                          heightScale, steps, RENODX_POM_BINARY_STEPS);
+}
+
+// ============================================================================
+// 1.17  Stochastic Transparency & Alpha Improvements
+// ----------------------------------------------------------------------------
+// Inspired by AC Shadows (SIGGRAPH 2025) stochastic alpha testing and
+// multi-layer transparency, adapted to techniques feasible via RenoDX
+// shader replacement.
+//
+// BACKGROUND:
+//   Most games use hard alpha testing:  clip(alpha - 0.5);
+//   This produces jaggy, binary edges on foliage, hair, fences, and any
+//   alpha-tested geometry.  Shadows from alpha-tested geometry also have
+//   hard, unnatural silhouettes.
+//
+//   AC Shadows replaced deterministic alpha testing with STOCHASTIC alpha
+//   testing — each fragment is accepted or rejected probabilistically
+//   based on its alpha value.  Over multiple frames, temporal accumulation
+//   (TAA / DLSS / FSR / XeSS) converges the noisy result to correct
+//   smooth transparency.  This produces:
+//     • Soft, anti-aliased foliage and hair edges
+//     • Natural, dappled shadow maps from foliage canopies
+//     • Smooth LOD cross-fade transitions
+//     • Correct multi-layer transparency without sorting
+//
+//   For RT any-hit shaders, stochastic alpha is also a major performance
+//   win — each intersection becomes a binary accept/reject decision,
+//   avoiding expensive transparency accumulation along rays.
+//
+// NOISE SOURCE — IS-FAST (§1.12):
+//   The quality of stochastic alpha testing depends critically on the
+//   noise source.  White noise produces slow convergence and visible
+//   grain.  The IS-FAST (Importance-Sampled Fast Approximation of
+//   Spatio-Temporal) blue noise system in §1.12 is ideal because:
+//
+//     • Spatially blue — neighboring pixels get well-separated threshold
+//       values, preventing clumpy accept/reject patterns.  This means
+//       edges appear smooth even before temporal accumulation.
+//
+//     • Temporally stratified — successive frames sample different parts
+//       of the threshold space, ensuring fast convergence.  TAA/DLSS
+//       typically converges the result in 4–8 frames.
+//
+//     • Importance-sampled — the sampling distribution can be shaped to
+//       concentrate samples where they matter most (near the alpha
+//       threshold boundary), accelerating convergence further.
+//
+//
+//   If an IS-FAST blue noise texture is not available, the algebraic
+//   hash fallback (StochasticAlphaHash) is provided — it generates
+//   acceptable spatio-temporal noise from screen position + frame index
+//   alone, requiring no additional texture bindings.
+//
+// Three techniques are provided:
+//
+//   a) Stochastic alpha test       — replaces clip(alpha - threshold)
+//   b) Stochastic shadow alpha     — variant tuned for shadow map passes
+//   c) Improved alpha-to-coverage  — blue-noise-driven SV_Coverage mask
+//
+// PREREQUISITES:
+//   • The game must have temporal accumulation active (TAA, DLSS, FSR,
+//     or XeSS) for the stochastic result to converge.  Without temporal
+//     filtering, the output is just noisy.  Nearly all modern titles
+//     ship with at least one of these.
+//   • A frame counter must be available.  In RenoDX mods, this is
+//     typically injected via the shader_injection constant buffer.
+//   • For best quality: an IS-FAST blue noise texture (§1.12) bound
+//     as an SRV.  For acceptable quality: use the hash fallback.
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// 1.17a  Stochastic Alpha Test
+// ---------------------------------------------------------------------------
+// Replaces a game's deterministic alpha test with a probabilistic one.
+//
+// Traditional:  clip(alpha - 0.5);        // hard binary edge
+// Stochastic:   clip(alpha - noise);      // soft probabilistic edge
+//
+// Over N frames of temporal accumulation, a texel with alpha = 0.7 will
+// pass the test ~70% of the time, converging to correct transparency.
+//
+// Two variants:
+//   (i)  Texture-based — uses an IS-FAST blue noise SRV (best quality)
+//   (ii) Hash-based    — algebraic hash, no extra textures needed
+//
+// Parameters:
+//   alpha          – the fragment's alpha value [0,1] from the albedo texture
+//   screenPos      – SV_Position.xy (pixel coordinates, not UV)
+//   frameIndex     – frame counter for temporal jitter (from shader_injection
+//                    CB or any per-frame counter).  Can be uint or float.
+//   sharpen        – edge sharpening factor (default 1.0).
+//                    Values > 1 tighten the stochastic band around the
+//                    alpha threshold, producing sharper edges with slower
+//                    convergence.  Values < 1 widen it for softer edges
+//                    with faster convergence.
+//                    Recommended: 0.8–1.5 depending on TAA quality.
+//
+// Usage:
+//   // In the foliage / hair pixel shader, replace:
+//   //   clip(alpha - 0.5);
+//   // With:
+//   renodx::rendering::StochasticAlphaTest(alpha, input.position.xy, frameIndex);
+// ---------------------------------------------------------------------------
+
+// -- 1.17a-i.  Stochastic Alpha Test — IS-FAST Blue Noise (best quality) ------
+//
+// Uses an IS-FAST blue noise texture (§1.12) for the threshold.  This
+// produces the smoothest edges and fastest temporal convergence because
+// the blue noise ensures neighboring pixels receive well-separated
+// thresholds (no clumping) and successive frames are temporally stratified.
+//
+// The blue noise texture should be:
+//   • R8_UNORM or R16_FLOAT, 64×64 or larger, tiling
+//   • Injected as SRV via push_descriptors
+//   • The same texture can be shared with SSAO, shadow dithering, etc.
+//
+// Parameters:
+//   alpha         – fragment alpha [0,1]
+//   blueNoiseTex  – the IS-FAST blue noise texture (Texture2D<float>)
+//   noiseSampler  – point-wrap sampler (wrap mode is essential for tiling)
+//   screenPos     – SV_Position.xy
+//   noiseSize     – blue noise texture dimensions, e.g. float2(64.0, 64.0)
+//   frameIndex    – frame counter for temporal jitter
+//   sharpen       – edge sharpening (default 1.0)
+void StochasticAlphaTestBlueNoise(
+    float              alpha,
+    Texture2D<float>   blueNoiseTex,
+    SamplerState       noiseSampler,
+    float2             screenPos,
+    float2             noiseSize,
+    uint               frameIndex,
+    float              sharpen = 1.0)
+{
+  // Sample blue noise, tiled across screen
+  float2 noiseUV = screenPos / noiseSize;
+  float  noise   = blueNoiseTex.SampleLevel(noiseSampler, noiseUV, 0);
+
+  // Temporal jitter: offset the noise by golden ratio per frame.
+  // This is the standard temporal blue noise animation technique —
+  // adding an irrational offset each frame produces a low-discrepancy
+  // sequence in [0,1] that is temporally stratified.
+  // See §1.12 IS-FAST for the theoretical basis.
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;  // (√5 - 1) / 2
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  // Sharpen: remap noise to concentrate around 0.5
+  // At sharpen = 1.0 this is identity.  Higher values steepen the
+  // transition band, making the stochastic edge thinner.
+  if (sharpen != 1.0)
+  {
+    noise = saturate((noise - 0.5) * sharpen + 0.5);
+  }
+
+  clip(alpha - noise);
+}
+
+// -- 1.17a-ii.  Stochastic Alpha Test — Hash Fallback (no extra textures) -----
+//
+// When no blue noise texture is available, this variant uses an algebraic
+// hash for the stochastic threshold.  The hash combines screen position
+// and frame index to produce spatially and temporally varying noise.
+//
+// Quality is lower than IS-FAST blue noise (the spatial spectrum is not
+// strictly blue, so some clumping may be visible), but it's sufficient
+// for most use cases and requires ZERO additional texture bindings —
+// making it the easiest to integrate into any shader.
+//
+// Parameters:
+//   alpha      – fragment alpha [0,1]
+//   screenPos  – SV_Position.xy
+//   frameIndex – frame counter
+//   sharpen    – edge sharpening (default 1.0)
+void StochasticAlphaTestHash(
+    float  alpha,
+    float2 screenPos,
+    uint   frameIndex,
+    float  sharpen = 1.0)
+{
+  // Spatial hash: interleaved gradient noise (Jimenez 2014)
+  // Produces reasonably well-distributed values across screen pixels
+  float noise = frac(52.9829189 * frac(
+      dot(screenPos, float2(0.06711056, 0.00583715))));
+
+  // Temporal jitter via golden ratio offset
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  // Sharpen
+  if (sharpen != 1.0)
+  {
+    noise = saturate((noise - 0.5) * sharpen + 0.5);
+  }
+
+  clip(alpha - noise);
+}
+
+// ---------------------------------------------------------------------------
+// 1.17b  Stochastic Shadow Alpha
+// ---------------------------------------------------------------------------
+// Variant of the stochastic alpha test specifically for shadow map passes.
+//
+// Shadow maps that use hard alpha testing produce sharp, unnatural shadow
+// silhouettes from foliage, fences, and hair.  Replacing the alpha test
+// with a stochastic version produces soft, dappled shadows that look
+// dramatically more natural — tree canopy shadows get realistic light
+// filtering, fence shadows get soft penumbra-like edges.
+//
+// This works particularly well because shadow maps are typically sampled
+// with PCF (Percentage Closer Filtering) or VSM, which inherently average
+// multiple texels.  The stochastic variation across shadow map texels acts
+// as a built-in soft shadow filter — each texel independently decides
+// whether it's in shadow based on alpha, and the PCF kernel averages
+// these binary decisions into a smooth result.
+//
+// KEY DIFFERENCE from 1.17a:
+//   The noise should use WORLD-SPACE or OBJECT-SPACE hashing rather than
+//   screen-space, so shadow texels remain stable as the light source moves.
+//   Screen-space noise would cause the shadow map to shimmer as the light
+//   pans.  World-space noise is view-independent and stable.
+//
+// Two variants:
+//   (i)  World-space hash — stable across light movement (recommended)
+//   (ii) Shadow-UV hash   — uses shadow map UVs (simpler, slightly less stable)
+//
+// Parameters:
+//   alpha      – fragment alpha [0,1] from the albedo texture
+//   worldPos   – world-space position of the fragment being shadow-tested
+//   frameIndex – frame counter for temporal jitter
+//   softness   – controls shadow edge softness (default 1.0)
+//                Higher = softer edges (wider stochastic band)
+//                Lower  = harder edges (narrower band)
+//                0.5–1.5 is a good range.
+//
+// Usage:
+//   // In the shadow pass pixel shader, replace:
+//   //   clip(alpha - 0.5);
+//   // With:
+//   renodx::rendering::StochasticShadowAlpha(alpha, worldPos, frameIndex);
+// ---------------------------------------------------------------------------
+
+// -- 1.17b-i.  Stochastic Shadow Alpha — World-Space Hash ---------------------
+void StochasticShadowAlphaWorld(
+    float  alpha,
+    float3 worldPos,
+    uint   frameIndex,
+    float  softness = 1.0)
+{
+  // World-space hash: stable regardless of camera/light movement.
+  // Uses a 3D variant of interleaved gradient noise.
+  float3 quantized = floor(worldPos * 50.0);  // quantize to ~2cm grid
+  float noise = frac(52.9829189 * frac(
+      quantized.x * 0.06711056 +
+      quantized.y * 0.00583715 +
+      quantized.z * 0.05413927));
+
+  // Temporal jitter
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  // Softness: inverse of sharpen — wider band = softer shadow edges
+  float sharpen = 1.0 / max(softness, 0.01);
+  noise = saturate((noise - 0.5) * sharpen + 0.5);
+
+  clip(alpha - noise);
+}
+
+// -- 1.17b-ii.  Stochastic Shadow Alpha — Shadow UV Hash ----------------------
+// Simpler variant that uses the shadow map UV as the hash seed.
+// Slightly less stable than world-space when shadow cascades shift,
+// but requires no world position — only the interpolated UV.
+//
+// Parameters:
+//   alpha      – fragment alpha [0,1]
+//   shadowUV   – shadow map UV (from the light-space projection)
+//   frameIndex – frame counter
+//   softness   – shadow softness (default 1.0)
+void StochasticShadowAlphaUV(
+    float  alpha,
+    float2 shadowUV,
+    uint   frameIndex,
+    float  softness = 1.0)
+{
+  // Hash from shadow map UV coordinates
+  float noise = frac(52.9829189 * frac(
+      dot(shadowUV * 1000.0, float2(0.06711056, 0.00583715))));
+
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  float sharpen = 1.0 / max(softness, 0.01);
+  noise = saturate((noise - 0.5) * sharpen + 0.5);
+
+  clip(alpha - noise);
+}
+
+// ---------------------------------------------------------------------------
+// 1.17c  Improved Alpha-to-Coverage
+// ---------------------------------------------------------------------------
+// Replaces hardware alpha-to-coverage with a blue-noise-driven coverage
+// mask written via SV_Coverage.
+//
+// Hardware A2C uses an implementation-defined ordered dither pattern that
+// produces visible banding — especially at low MSAA sample counts (2× or
+// 4×).  By generating the coverage mask from IS-FAST blue noise (§1.12)
+// with temporal jitter, we get:
+//
+//   • Per-pixel variation instead of repeating dither patterns
+//   • Temporal stratification for fast TAA/DLSS convergence
+//   • Smoother apparent edges, especially on foliage and hair
+//
+// REQUIREMENTS:
+//   • MSAA must be enabled (this technique outputs SV_Coverage bits)
+//   • The game's foliage/hair shader must be using A2C or alpha test
+//   • A blue noise texture (IS-FAST §1.12) for best quality, OR use
+//     the hash fallback variant
+//
+// HOW TO USE:
+//   In your replacement pixel shader, instead of relying on hardware A2C
+//   or the game's alpha test, call this function and output the returned
+//   coverage mask via the SV_Coverage semantic:
+//
+//     struct PSOutput {
+//       float4 color    : SV_Target0;
+//       uint   coverage : SV_Coverage;   // <-- add this
+//     };
+//
+//     PSOutput main(...) {
+//       PSOutput o;
+//       o.color = ...;
+//       o.coverage = renodx::rendering::AlphaToCoverageBlueNoise(
+//           alpha, blueNoiseTex, sampler, screenPos, noiseSize,
+//           frameIndex, sampleCount);
+//       return o;
+//     }
+//
+// Parameters:
+//   alpha        – fragment alpha [0,1]
+//   noise        – blue noise value [0,1] (from IS-FAST §1.12 or hash).
+//                  Should already include temporal jitter.
+//   sampleCount  – MSAA sample count (2, 4, or 8)
+//
+// Returns:  uint coverage mask with bits set per MSAA sample.
+// ---------------------------------------------------------------------------
+uint AlphaToCoverageBlueNoise(
+    float alpha,
+    float noise,
+    uint  sampleCount)
+{
+  uint coverage = 0;
+
+  // Dither the alpha threshold per sample using the noise value.
+  // Each sample gets a slightly offset threshold derived from the single
+  // noise value, producing a coverage ramp across samples.
+  for (uint s = 0; s < sampleCount; s++)
+  {
+    // Per-sample threshold: evenly spaced across [0,1], offset by noise
+    float sampleThreshold = frac(noise + (float)s / (float)sampleCount);
+
+    if (alpha > sampleThreshold)
+      coverage |= (1u << s);
+  }
+
+  return coverage;
+}
+
+// ---------------------------------------------------------------------------
+// 1.17c′  Alpha-to-Coverage — Convenience wrapper with IS-FAST texture
+// ---------------------------------------------------------------------------
+// Combines blue noise sampling, temporal jitter, and coverage mask
+// generation in a single call.
+//
+// Parameters:
+//   alpha         – fragment alpha [0,1]
+//   blueNoiseTex  – IS-FAST blue noise texture (Texture2D<float>)
+//   noiseSampler  – point-wrap sampler
+//   screenPos     – SV_Position.xy
+//   noiseSize     – blue noise texture dimensions
+//   frameIndex    – frame counter
+//   sampleCount   – MSAA sample count (2, 4, or 8)
+//
+// Returns:  uint coverage mask for SV_Coverage output.
+uint AlphaToCoverageISFAST(
+    float              alpha,
+    Texture2D<float>   blueNoiseTex,
+    SamplerState       noiseSampler,
+    float2             screenPos,
+    float2             noiseSize,
+    uint               frameIndex,
+    uint               sampleCount)
+{
+  // Sample and animate blue noise (same pattern as §1.17a-i)
+  float2 noiseUV = screenPos / noiseSize;
+  float  noise   = blueNoiseTex.SampleLevel(noiseSampler, noiseUV, 0);
+
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  return AlphaToCoverageBlueNoise(alpha, noise, sampleCount);
+}
+
+// ---------------------------------------------------------------------------
+// 1.17c″  Alpha-to-Coverage — Hash Fallback (no texture)
+// ---------------------------------------------------------------------------
+// Same as above but uses the algebraic hash instead of a blue noise
+// texture.  Lower quality but zero additional resource bindings.
+//
+// Parameters:
+//   alpha       – fragment alpha [0,1]
+//   screenPos   – SV_Position.xy
+//   frameIndex  – frame counter
+//   sampleCount – MSAA sample count (2, 4, or 8)
+//
+// Returns:  uint coverage mask for SV_Coverage output.
+uint AlphaToCoverageHash(
+    float  alpha,
+    float2 screenPos,
+    uint   frameIndex,
+    uint   sampleCount)
+{
+  float noise = frac(52.9829189 * frac(
+      dot(screenPos, float2(0.06711056, 0.00583715))));
+
+  static const float GOLDEN_RATIO_FRAC = 0.6180339887;
+  noise = frac(noise + (float)frameIndex * GOLDEN_RATIO_FRAC);
+
+  return AlphaToCoverageBlueNoise(alpha, noise, sampleCount);
+}
+
+// ============================================================================
+// 1.18  Temporal Stability Techniques
+// ----------------------------------------------------------------------------
+// Inspired by AC Shadows (SIGGRAPH 2025) temporal stabilisation system and
+// modern denoiser architectures (SVGF, ReBLUR, A-SVGF).
+//
+// BACKGROUND:
+//   Hybrid rendering mixes rasterised and ray-traced signals.  RT effects
+//   (shadows, GI, reflections, AO) are noisy because they use few rays per
+//   pixel.  Temporal accumulation blends the current noisy frame with
+//   history to converge toward a clean result.  But naive accumulation
+//   produces ghosting on moving objects and smearing on disoccluded
+//   surfaces.  AC Shadows solved this with a multi-component system:
+//
+//     A) Variance-guided temporal accumulation — dynamically adjust the
+//        blend factor per pixel based on local signal variance. High
+//        variance (noisy) → accept more of current frame for faster
+//        convergence.  Low variance (stable) → retain more history for
+//        clean output.
+//
+//     B) Disocclusion detection — reject temporal history for pixels
+//        where the surface has changed (camera moved, object moved,
+//        depth or normal discontinuity).  Uses depth, normal, motion
+//        vector and optionally material ID.
+//
+//     C) Neighborhood clamping (variance clipping) — constrain the
+//        reprojected history to lie within the plausible range defined
+//        by the current frame's local statistics [mean ± k·σ].  This
+//        prevents ghosted history from persisting even when disocclusion
+//        detection misses a change.  Same technique as Karis 2014 /
+//        Salvi 2016 TAA, but applied per-signal.
+//
+//     D) Adaptive blend factor mapping — maps variance and confidence
+//        metrics to the EMA blend weight.  Replaces fixed blend factors.
+//
+//     E) Per-signal temporal configuration — different signals (shadows,
+//        GI, reflections, AO) have different convergence rates and
+//        require different blend/clamp parameters.
+//
+// HOW THIS CONNECTS TO EXISTING SECTIONS:
+//
+//   §1.10l ShadowConfidence — implements binary state tracking for shadows
+//     (lit/unlit change detection via XOR bitmap).  This is the Markov
+//     chain state evolution pattern applied to shadow signals.  The
+//     temporal stability functions here generalise that concept to
+//     continuous-valued signals (luminance, color) using variance.
+//
+//   §1.10m SpatialHashShadowDenoise — provides spatial-only fallback
+//     filtering for when temporal history is unavailable.  The
+//     disocclusion detection in this section tells you WHEN to fall
+//     back to spatial filtering.
+//
+//   §1.10n ConfidenceAdaptiveShadow — combines §1.10l and §1.10m into
+//     a confidence-driven pipeline.  The generic TemporalBlend() and
+//     VarianceGuidedBlendFactor() functions here can replace the
+//     shadow-specific confidence logic with a more general solution.
+//
+//   §1.9f ComputeScreenSpaceBentNormal — uses a temporalOffset parameter
+//     to jitter hemisphere samples per frame.  The variance computation
+//     here can measure whether the bent-normal AO has converged, and
+//     the adaptive blend can drive a temporal accumulation buffer.
+//
+//   §1.12 IS-FAST — provides the blue noise foundation for temporal
+//     stratification.  All stochastic effects (§1.17 alpha, §1.9f AO,
+//     shadow dithering) rely on IS-FAST for the noise that these
+//     temporal stability functions converge.
+//
+//   §1.17 Stochastic Alpha — uses golden ratio temporal jitter.  The
+//     per-signal temporal config (TemporalConfig struct) can provide
+//     the blend/clamp settings that control how quickly the stochastic
+//     alpha converges under TAA.
+//
+// RenoDX APPLICABILITY:
+//
+//   Tier 1 — Pure ALU in existing shaders (highest feasibility):
+//     • Variance computation + neighborhood clamping can be injected
+//       into any shader that does temporal accumulation (the game's
+//       TAA, shadow denoiser, or temporal filter).
+//     • Identify the game's temporal blend shader (usually a fullscreen
+//       PS that reads current + history buffers) and replace it with a
+//       variance-guided version using these functions.
+//     • The adaptive blend factor mapping is just smoothstep/lerp —
+//       zero additional cost.
+//
+//   Tier 2 — Injected compute pass (medium feasibility):
+//     • Disocclusion detection as a pre-pass that writes a "history
+//       validity" mask texture.
+//     • Requires: motion vectors (most modern games have them for TAA)
+//       + depth from current and previous frames.
+//     • The mask is consumed by the temporal blend shader to decide
+//       whether to trust history or fall back to spatial filtering.
+//
+//   Tier 3 — Enhancing existing game denoisers (per-game):
+//     • Many games already have temporal denoisers for shadows/GI but
+//       with suboptimal parameters (too aggressive or too conservative).
+//     • Overriding the denoiser's constant buffer values (blend factor,
+//       clamp range) via RenoDX CB override can improve stability
+//       without replacing any shaders.
+//
+// Functions provided:
+//
+//   a) LocalVariance        — compute mean + variance from a 3×3 neighborhood
+//   b) NeighborhoodClamp    — clamp history to [mean ± k·σ]
+//   c) DisocclusionDetect   — multi-signal history validity check
+//   d) VarianceGuidedBlendFactor — map variance to temporal blend weight
+//   e) TemporalBlend        — full pipeline: clamp + blend + disocclusion
+//   f) TemporalConfig       — per-signal parameter struct with presets
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// 1.18a  Local Variance Computation
+// ---------------------------------------------------------------------------
+// Computes the mean and variance of a signal (luminance or color) in a
+// 3×3 pixel neighborhood around the current pixel.
+//
+// This is the foundation for variance-guided accumulation and neighborhood
+// clamping.  The variance tells you how noisy the current signal is:
+//   • High variance → noisy, under-sampled → need more samples / faster blend
+//   • Low variance  → converged, stable → retain history / slower blend
+//
+// The 3×3 neighborhood is the standard window used by SVGF, ReBLUR, and
+// AC Shadows.  Larger windows (5×5, 7×7) capture more context but are
+// more expensive and blur the variance estimate across edges.
+//
+// Two variants:
+//   (i)  Scalar (luminance) — for AO, shadows, depth-based signals
+//   (ii) Color (float3)     — for GI, reflections, lit color signals
+// ---------------------------------------------------------------------------
+
+// Holds local statistics for a neighborhood
+struct LocalStats
+{
+  float  mean;       // average luminance in the neighborhood
+  float  variance;   // variance of luminance
+  float  stddev;     // sqrt(variance) — standard deviation
+  float  minVal;     // minimum luminance in the window
+  float  maxVal;     // maximum luminance in the window
+};
+
+struct LocalStatsColor
+{
+  float3 mean;       // average color
+  float3 variance;   // per-channel variance
+  float3 stddev;     // per-channel standard deviation
+  float3 minVal;     // per-channel minimum
+  float3 maxVal;     // per-channel maximum
+};
+
+// -- 1.18a-i.  Scalar Local Variance (3×3) ------------------------------------
+// Computes luminance statistics from a 3×3 neighborhood.
+//
+// Parameters:
+//   colorTex     – the signal texture (e.g. shadow buffer, AO buffer,
+//                  or lit scene color).  Luminance is computed internally
+//                  using BT.709 weights.
+//   pointSampler – point-clamp sampler (must be point, not bilinear, to
+//                  avoid averaging across the window)
+//   screenUV     – current pixel's UV [0,1]²
+//   texelSize    – 1.0 / textureResolution (e.g. float2(1/1920, 1/1080))
+//
+// Returns:  LocalStats struct with mean, variance, stddev, min, max.
+LocalStats ComputeLocalVariance(
+    Texture2D<float4> colorTex,
+    SamplerState      pointSampler,
+    float2            screenUV,
+    float2            texelSize)
+{
+  LocalStats s;
+  s.mean    = 0.0;
+  s.minVal  = 1e10;
+  s.maxVal  = -1e10;
+
+  float moment2 = 0.0;  // sum of squared luminances
+
+  // 3×3 gather
+  [unroll]
+  for (int y = -1; y <= 1; y++)
+  {
+    [unroll]
+    for (int x = -1; x <= 1; x++)
+    {
+      float2 offset = float2((float)x, (float)y) * texelSize;
+      float3 sample_color = colorTex.SampleLevel(
+          pointSampler, screenUV + offset, 0).rgb;
+      float lum = dot(sample_color, float3(0.2126, 0.7152, 0.0722));
+
+      s.mean   += lum;
+      moment2  += lum * lum;
+      s.minVal  = min(s.minVal, lum);
+      s.maxVal  = max(s.maxVal, lum);
+    }
+  }
+
+  s.mean    /= 9.0;
+  moment2   /= 9.0;
+  s.variance = max(moment2 - s.mean * s.mean, 0.0);
+  s.stddev   = sqrt(s.variance);
+
+  return s;
+}
+
+// -- 1.18a-i′.  Scalar Local Variance from raw float buffer -------------------
+// Variant for single-channel textures (shadow map results, AO buffers).
+// Avoids the luminance conversion since the signal is already scalar.
+LocalStats ComputeLocalVarianceScalar(
+    Texture2D<float>  signalTex,
+    SamplerState      pointSampler,
+    float2            screenUV,
+    float2            texelSize)
+{
+  LocalStats s;
+  s.mean    = 0.0;
+  s.minVal  = 1e10;
+  s.maxVal  = -1e10;
+
+  float moment2 = 0.0;
+
+  [unroll]
+  for (int y = -1; y <= 1; y++)
+  {
+    [unroll]
+    for (int x = -1; x <= 1; x++)
+    {
+      float2 offset = float2((float)x, (float)y) * texelSize;
+      float val = signalTex.SampleLevel(pointSampler, screenUV + offset, 0);
+
+      s.mean   += val;
+      moment2  += val * val;
+      s.minVal  = min(s.minVal, val);
+      s.maxVal  = max(s.maxVal, val);
+    }
+  }
+
+  s.mean    /= 9.0;
+  moment2   /= 9.0;
+  s.variance = max(moment2 - s.mean * s.mean, 0.0);
+  s.stddev   = sqrt(s.variance);
+
+  return s;
+}
+
+// -- 1.18a-ii.  Color Local Variance (3×3) ------------------------------------
+// Per-channel statistics for color signals (GI, reflections, lit scene).
+LocalStatsColor ComputeLocalVarianceColor(
+    Texture2D<float4> colorTex,
+    SamplerState      pointSampler,
+    float2            screenUV,
+    float2            texelSize)
+{
+  LocalStatsColor s;
+  s.mean    = 0.0;
+  s.minVal  = 1e10;
+  s.maxVal  = -1e10;
+
+  float3 moment2 = 0.0;
+
+  [unroll]
+  for (int y = -1; y <= 1; y++)
+  {
+    [unroll]
+    for (int x = -1; x <= 1; x++)
+    {
+      float2 offset = float2((float)x, (float)y) * texelSize;
+      float3 c = colorTex.SampleLevel(
+          pointSampler, screenUV + offset, 0).rgb;
+
+      s.mean   += c;
+      moment2  += c * c;
+      s.minVal  = min(s.minVal, c);
+      s.maxVal  = max(s.maxVal, c);
+    }
+  }
+
+  s.mean    /= 9.0;
+  moment2   /= 9.0;
+  s.variance = max(moment2 - s.mean * s.mean, 0.0);
+  s.stddev   = sqrt(s.variance);
+
+  return s;
+}
+
+// ---------------------------------------------------------------------------
+// 1.18b  Neighborhood Clamping (Variance Clipping)
+// ---------------------------------------------------------------------------
+// Constrains a reprojected history value to lie within the range of
+// plausible values defined by the current frame's local statistics.
+//
+// This is the core anti-ghosting mechanism used by modern TAA (Karis 2014,
+// Salvi 2016) and all production denoisers (SVGF, ReBLUR, A-SVGF).  AC
+// Shadows applies it independently to each denoised signal.
+//
+// How it works:
+//   1. Compute the mean (μ) and standard deviation (σ) of the current
+//      frame's signal in a local neighborhood (from §1.18a).
+//   2. Define a "plausible range" as [μ - k·σ, μ + k·σ].
+//   3. Clamp the reprojected history to this range.
+//   4. Blend the clamped history with the current frame.
+//
+// The clamp factor k controls ghosting vs. noise:
+//   k = 0.5 — very aggressive, almost no ghosting, but noisy
+//   k = 1.0 — standard, good for fast-changing signals (shadows)
+//   k = 1.5 — moderate, good for medium signals (AO)
+//   k = 2.0 — relaxed, smooth but slower response (GI)
+//   k = 3.0 — very relaxed, only catches major disocclusions
+//
+// Two variants:
+//   (i)  Scalar — for luminance / mono signals
+//   (ii) Color  — for RGB signals
+// ---------------------------------------------------------------------------
+
+// -- 1.18b-i.  Scalar Neighborhood Clamp --------------------------------------
+// Parameters:
+//   history   – reprojected value from previous frame
+//   stats     – local statistics from ComputeLocalVariance()
+//   clampK    – standard deviations for the clamp range (default 1.25)
+//
+// Returns:  clamped history value.
+float NeighborhoodClamp(
+    float      history,
+    LocalStats stats,
+    float      clampK = 1.25)
+{
+  float lo = stats.mean - clampK * stats.stddev;
+  float hi = stats.mean + clampK * stats.stddev;
+  return clamp(history, lo, hi);
+}
+
+// -- 1.18b-ii.  Color Neighborhood Clamp --------------------------------------
+float3 NeighborhoodClampColor(
+    float3          history,
+    LocalStatsColor stats,
+    float           clampK = 1.25)
+{
+  float3 lo = stats.mean - clampK * stats.stddev;
+  float3 hi = stats.mean + clampK * stats.stddev;
+  return clamp(history, lo, hi);
+}
+
+// -- 1.18b-iii.  AABB Clamp (min/max variant) ---------------------------------
+// Simpler variant that clamps to the actual min/max observed in the
+// neighborhood rather than mean ± k·σ.  Tighter but more susceptible
+// to outliers.  Useful when the signal is already fairly clean.
+float NeighborhoodClampMinMax(float history, LocalStats stats)
+{
+  return clamp(history, stats.minVal, stats.maxVal);
+}
+
+float3 NeighborhoodClampMinMaxColor(float3 history, LocalStatsColor stats)
+{
+  return clamp(history, stats.minVal, stats.maxVal);
+}
+
+// ---------------------------------------------------------------------------
+// 1.18c  Disocclusion Detection
+// ---------------------------------------------------------------------------
+// Determines whether the temporal history at a pixel is valid — i.e. whether
+// the reprojected previous-frame data represents the same surface.
+//
+// AC Shadows uses multiple signals to detect disocclusion, each catching
+// different failure modes:
+//
+//   1. Depth discrepancy — compare current depth to reprojected depth.
+//      A large difference means the surface changed (something was revealed
+//      or occluded by camera/object motion).
+//
+//   2. Normal discrepancy — compare current normal to reprojected normal.
+//      A large angular difference means different geometry is now visible.
+//
+//   3. Motion vector confidence — if the reprojected UV falls outside
+//      [0,1]² (offscreen), history is invalid.  Also checks for extreme
+//      motion vector magnitude (reliability heuristic).
+//
+//   4. Material ID mismatch — if the game stores material IDs in the
+//      G-buffer, a mismatch means different objects → hard reject.
+//      This is optional since not all games expose material IDs.
+//
+// When disocclusion is detected, the temporal blend should fall back to
+// spatial-only filtering (e.g. §1.10m SpatialHashShadowDenoise), accepting
+// more noise rather than showing ghosted artifacts.
+//
+// Parameters:
+//   currentDepth       – linear view-space depth of the current pixel
+//   reprojectedDepth   – depth from the previous frame at the reprojected UV
+//   currentNormal      – world-space normal at the current pixel
+//   reprojectedNormal  – normal from the previous frame at the reprojected UV
+//   reprojectedUV      – the UV after applying the motion vector
+//   depthThreshold     – relative depth difference threshold (default 0.05)
+//                        0.05 = 5% relative difference triggers rejection.
+//                        Lower = more sensitive, catches thin geometry.
+//                        Higher = more forgiving, may let leaks through.
+//   normalThreshold    – minimum dot product for normal similarity
+//                        (default 0.9 ≈ ~26° angular difference).
+//                        Lower = more forgiving.  Higher = stricter.
+//
+// Returns:  validity weight [0,1].
+//           1.0 = history is fully valid, trust it.
+//           0.0 = disoccluded, reject history entirely.
+//           Intermediate values = partial validity (gradual rejection).
+//
+// Usage:
+//   float validity = renodx::rendering::DisocclusionDetect(
+//       linDepth, prevLinDepth, normal, prevNormal, reprojUV);
+//   blendFactor = lerp(1.0, blendFactor, validity);  // reset on disocclusion
+// ---------------------------------------------------------------------------
+float DisocclusionDetect(
+    float  currentDepth,
+    float  reprojectedDepth,
+    float3 currentNormal,
+    float3 reprojectedNormal,
+    float2 reprojectedUV,
+    float  depthThreshold  = 0.05,
+    float  normalThreshold = 0.9)
+{
+  // 1. Screen bounds check — reprojected UV outside screen?
+  float inBounds = (all(reprojectedUV >= 0.0) && all(reprojectedUV <= 1.0))
+                   ? 1.0 : 0.0;
+
+  // 2. Depth similarity — relative difference
+  float avgDepth   = 0.5 * (currentDepth + reprojectedDepth) + 1e-6;
+  float depthDiff  = abs(currentDepth - reprojectedDepth) / avgDepth;
+  float depthValid = 1.0 - smoothstep(depthThreshold * 0.5,
+                                       depthThreshold, depthDiff);
+
+  // 3. Normal similarity — dot product
+  float normalDot   = dot(normalize(currentNormal),
+                          normalize(reprojectedNormal));
+  float normalValid = smoothstep(normalThreshold - 0.1,
+                                  normalThreshold, normalDot);
+
+  // Combine — all checks must pass
+  return inBounds * depthValid * normalValid;
+}
+
+// ---------------------------------------------------------------------------
+// 1.18c′  Disocclusion Detection — Simplified (depth + bounds only)
+// ---------------------------------------------------------------------------
+// Lighter variant that only checks depth discrepancy and screen bounds.
+// Use when normals from the previous frame are not available (common —
+// many games don't preserve the previous normal buffer).
+//
+// Parameters:
+//   currentDepth     – linear view-space depth at the current pixel
+//   reprojectedDepth – previous-frame depth at the reprojected UV
+//   reprojectedUV    – UV after motion vector
+//   depthThreshold   – relative depth threshold (default 0.05)
+//
+// Returns:  validity [0,1].
+float DisocclusionDetectSimple(
+    float  currentDepth,
+    float  reprojectedDepth,
+    float2 reprojectedUV,
+    float  depthThreshold = 0.05)
+{
+  float inBounds = (all(reprojectedUV >= 0.0) && all(reprojectedUV <= 1.0))
+                   ? 1.0 : 0.0;
+
+  float avgDepth  = 0.5 * (currentDepth + reprojectedDepth) + 1e-6;
+  float depthDiff = abs(currentDepth - reprojectedDepth) / avgDepth;
+  float depthValid = 1.0 - smoothstep(depthThreshold * 0.5,
+                                       depthThreshold, depthDiff);
+
+  return inBounds * depthValid;
+}
+
+// ---------------------------------------------------------------------------
+// 1.18d  Variance-Guided Blend Factor
+// ---------------------------------------------------------------------------
+// Maps local signal variance to a temporal accumulation blend weight.
+// Replaces fixed EMA blend factors with an adaptive one.
+//
+// AC Shadows' insight:
+//   Fixed blend factors are always a compromise.  Too low (0.02) and noise
+//   persists for many frames.  Too high (0.2) and you get ghosting on
+//   moving objects.  By measuring the local variance, we can set the
+//   blend factor optimally per pixel:
+//
+//     High variance (noisy) → high blend factor → accept more current frame
+//     Low variance (converged) → low blend factor → retain more history
+//
+// The mapping uses a smoothstep between configurable thresholds:
+//   blend = lerp(minBlend, maxBlend, smoothstep(lo, hi, variance))
+//
+// Where:
+//   minBlend = blend factor when fully converged (keep most history)
+//   maxBlend = blend factor when fully noisy (accept most current)
+//   lo = variance below which signal is considered converged
+//   hi = variance above which signal is considered fully noisy
+//
+// Parameters:
+//   variance    – local variance from ComputeLocalVariance() .variance field
+//   minBlend    – blend factor when converged (default 0.02)
+//   maxBlend    – blend factor when noisy (default 0.3)
+//   varianceLo  – variance floor (below = converged) (default 0.001)
+//   varianceHi  – variance ceiling (above = fully noisy) (default 0.1)
+//
+// Returns:  blend factor [minBlend, maxBlend] for temporal EMA.
+//           Use as:  result = lerp(clampedHistory, current, blendFactor)
+float VarianceGuidedBlendFactor(
+    float variance,
+    float minBlend   = 0.02,
+    float maxBlend   = 0.3,
+    float varianceLo = 0.001,
+    float varianceHi = 0.1)
+{
+  float t = smoothstep(varianceLo, varianceHi, variance);
+  return lerp(minBlend, maxBlend, t);
+}
+
+// ---------------------------------------------------------------------------
+// 1.18e  Full Temporal Blend Pipeline
+// ---------------------------------------------------------------------------
+// Composes neighborhood clamping + disocclusion + variance-guided blend
+// into a single call.  This is the complete temporal accumulation function
+// that replaces a fixed `lerp(history, current, 0.05)` with the full
+// AC Shadows-style adaptive pipeline.
+//
+// Data flow:
+//   1. Compute local statistics of current frame (§1.18a)
+//   2. Clamp reprojected history to neighborhood range (§1.18b)
+//   3. Check disocclusion — is the history valid? (§1.18c)
+//   4. Compute adaptive blend factor from variance (§1.18d)
+//   5. Override blend to 1.0 ("use current only") on disocclusion
+//   6. Blend clamped history with current frame
+//
+// Two variants:
+//   (i)  Scalar — for shadow, AO, depth-based signals
+//   (ii) Color  — for GI, reflections, lit scene
+//
+// Parameters:
+//   current          – current frame signal (scalar or float3)
+//   history          – reprojected previous-frame signal
+//   stats            – local statistics from ComputeLocalVariance()
+//   historyValidity  – disocclusion test result from DisocclusionDetect()
+//                      [0,1]. 0 = disoccluded, 1 = valid.
+//   clampK           – neighborhood clamp width in stddevs (default 1.25)
+//   minBlend         – converged blend factor (default 0.02)
+//   maxBlend         – noisy blend factor (default 0.3)
+//   varianceLo       – converged variance threshold (default 0.001)
+//   varianceHi       – noisy variance threshold (default 0.1)
+//
+// Returns:  temporally accumulated result.
+// ---------------------------------------------------------------------------
+
+// -- 1.18e-i.  Scalar Temporal Blend ------------------------------------------
+float TemporalBlend(
+    float      current,
+    float      history,
+    LocalStats stats,
+    float      historyValidity,
+    float      clampK     = 1.25,
+    float      minBlend   = 0.02,
+    float      maxBlend   = 0.3,
+    float      varianceLo = 0.001,
+    float      varianceHi = 0.1)
+{
+  // 1. Clamp history to plausible range
+  float clamped = NeighborhoodClamp(history, stats, clampK);
+
+  // 2. Adaptive blend from variance
+  float blend = VarianceGuidedBlendFactor(
+      stats.variance, minBlend, maxBlend, varianceLo, varianceHi);
+
+  // 3. On disocclusion, override: use current frame entirely
+  blend = lerp(1.0, blend, historyValidity);
+
+  // 4. Blend
+  return lerp(clamped, current, blend);
+}
+
+// -- 1.18e-ii.  Color Temporal Blend ------------------------------------------
+float3 TemporalBlendColor(
+    float3          current,
+    float3          history,
+    LocalStatsColor stats,
+    float           historyValidity,
+    float           clampK     = 1.25,
+    float           minBlend   = 0.02,
+    float           maxBlend   = 0.3,
+    float           varianceLo = 0.001,
+    float           varianceHi = 0.1)
+{
+  // 1. Clamp history
+  float3 clamped = NeighborhoodClampColor(history, stats, clampK);
+
+  // 2. Scalar variance for blend factor (use luminance variance)
+  float lumVar = dot(stats.variance, float3(0.2126, 0.7152, 0.0722));
+  float blend = VarianceGuidedBlendFactor(
+      lumVar, minBlend, maxBlend, varianceLo, varianceHi);
+
+  // 3. Disocclusion override
+  blend = lerp(1.0, blend, historyValidity);
+
+  // 4. Blend
+  return lerp(clamped, current, blend);
+}
+
+// ---------------------------------------------------------------------------
+// 1.18f  Per-Signal Temporal Configuration
+// ---------------------------------------------------------------------------
+// AC Shadows applies different temporal settings per signal type because
+// each signal has different convergence characteristics:
+//
+//   • Shadows change rapidly (light/object motion) and need responsive
+//     blend factors with moderate clamping.
+//   • Diffuse GI changes slowly (probes update over many frames) and can
+//     accumulate aggressively with relaxed clamping.
+//   • Specular reflections are highly view-dependent and invalidate
+//     quickly when the camera moves, needing tight clamping.
+//   • AO is relatively stable and benefits from moderate accumulation.
+//
+// The TemporalConfig struct encapsulates all per-signal parameters,
+// and factory functions provide AC Shadows-inspired presets.
+//
+// Usage:
+//   TemporalConfig cfg = TemporalConfigShadow();
+//   float result = TemporalBlendWithConfig(current, history, stats,
+//                                          validity, cfg);
+// ---------------------------------------------------------------------------
+
+struct TemporalConfig
+{
+  float clampK;       // neighborhood clamp width (stddevs)
+  float minBlend;     // blend factor when converged
+  float maxBlend;     // blend factor when noisy/disoccluded
+  float varianceLo;   // variance below = converged
+  float varianceHi;   // variance above = fully noisy
+  float depthThresh;  // disocclusion depth threshold
+  float normalThresh; // disocclusion normal threshold
+};
+
+// -- Presets ------------------------------------------------------------------
+
+// Shadow denoiser — responsive, moderate clamp
+// Shadows change with light and object motion.  Need to react quickly to
+// transitions between lit and shadowed state.  Moderate clamp prevents
+// ghosted shadow edges while allowing some temporal smoothing.
+TemporalConfig TemporalConfigShadow()
+{
+  TemporalConfig c;
+  c.clampK       = 1.5;     // moderate clamp width
+  c.minBlend     = 0.05;    // 5% new when converged
+  c.maxBlend     = 0.25;    // 25% new when noisy
+  c.varianceLo   = 0.002;
+  c.varianceHi   = 0.08;
+  c.depthThresh  = 0.03;
+  c.normalThresh = 0.9;
+  return c;
+}
+
+// Diffuse GI — aggressive accumulation, relaxed clamp
+// GI from probes / lightmaps changes slowly (probe updates are spread
+// over many frames).  Can accumulate aggressively for clean results.
+// Relaxed clamp avoids discarding history during gradual lighting shifts.
+TemporalConfig TemporalConfigGI()
+{
+  TemporalConfig c;
+  c.clampK       = 2.5;     // relaxed clamp
+  c.minBlend     = 0.02;    // 2% new when converged (aggressive accumulation)
+  c.maxBlend     = 0.15;    // 15% new when noisy
+  c.varianceLo   = 0.001;
+  c.varianceHi   = 0.05;
+  c.depthThresh  = 0.05;
+  c.normalThresh = 0.85;
+  return c;
+}
+
+// Specular reflections — conservative, tight clamp
+// Reflections are highly view-dependent — even small camera rotation
+// invalidates the reflection direction.  Tight clamp catches the
+// fast-changing content.  Higher blend factor accepts camera-induced
+// noise quickly.
+TemporalConfig TemporalConfigReflections()
+{
+  TemporalConfig c;
+  c.clampK       = 1.0;     // tight clamp
+  c.minBlend     = 0.08;    // 8% new when converged
+  c.maxBlend     = 0.35;    // 35% new when noisy
+  c.varianceLo   = 0.005;
+  c.varianceHi   = 0.15;
+  c.depthThresh  = 0.03;
+  c.normalThresh = 0.95;
+  return c;
+}
+
+// Ambient occlusion — moderate everything
+// AO is relatively stable across frames.  Object motion matters more
+// than camera motion.  Moderate settings for balanced noise/ghosting.
+TemporalConfig TemporalConfigAO()
+{
+  TemporalConfig c;
+  c.clampK       = 1.5;
+  c.minBlend     = 0.03;    // 3% new when converged
+  c.maxBlend     = 0.2;     // 20% new when noisy
+  c.varianceLo   = 0.001;
+  c.varianceHi   = 0.06;
+  c.depthThresh  = 0.04;
+  c.normalThresh = 0.9;
+  return c;
+}
+
+// Stochastic alpha convergence — compatible with §1.17
+// Stochastic alpha test produces binary noise that needs fast convergence
+// under TAA/DLSS.  Need high blend factor and tight clamp so the noise
+// resolves quickly.  This config is designed for the signal AFTER the
+// temporal upscaler has had a chance to accumulate.
+TemporalConfig TemporalConfigStochasticAlpha()
+{
+  TemporalConfig c;
+  c.clampK       = 1.0;     // tight — want fast response to alpha changes
+  c.minBlend     = 0.1;     // 10% new (TAA should do most accumulation)
+  c.maxBlend     = 0.5;     // 50% new when noisy (aggressive catch-up)
+  c.varianceLo   = 0.01;
+  c.varianceHi   = 0.2;
+  c.depthThresh  = 0.03;
+  c.normalThresh = 0.8;     // relaxed — foliage normals vary a lot
+  return c;
+}
+
+// -- 1.18f′  Temporal Blend with Config ----------------------------------------
+// Convenience function that uses a TemporalConfig struct for all parameters.
+//
+// Parameters:
+//   current   – current frame signal (scalar)
+//   history   – reprojected previous frame signal
+//   stats     – local statistics from ComputeLocalVariance()
+//   validity  – disocclusion result from DisocclusionDetect()
+//   cfg       – per-signal configuration from a preset or custom values
+//
+// Returns:  temporally accumulated result.
+float TemporalBlendWithConfig(
+    float          current,
+    float          history,
+    LocalStats     stats,
+    float          validity,
+    TemporalConfig cfg)
+{
+  return TemporalBlend(current, history, stats, validity,
+                       cfg.clampK, cfg.minBlend, cfg.maxBlend,
+                       cfg.varianceLo, cfg.varianceHi);
+}
+
+// Color variant
+float3 TemporalBlendColorWithConfig(
+    float3          current,
+    float3          history,
+    LocalStatsColor stats,
+    float           validity,
+    TemporalConfig  cfg)
+{
+  return TemporalBlendColor(current, history, stats, validity,
+                            cfg.clampK, cfg.minBlend, cfg.maxBlend,
+                            cfg.varianceLo, cfg.varianceHi);
 }
 
 // ############################################################################
