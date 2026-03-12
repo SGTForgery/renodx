@@ -1,5 +1,7 @@
 
 
+#include "../shared.h"
+
 static float3 _58 = (float3)0;
 
 [[vk::binding(0, 1)]]
@@ -50,11 +52,16 @@ void frag_main()
     bool3 _121 = (_5_m2 < 0.0f).xxx;
     float3 _123 = _117 * (1.0f + _5_m2);
     float3 _125 = lerp(_117, 1.0f.xxx, _5_m2.xxx);
-    float3 _131 = lerp(_68.xyz, float3(_121.x ? _123.x : _125.x, _121.y ? _123.y : _125.y, _121.z ? _123.z : _125.z), _5_m3.xxx) * 0.0045045041479170322418212890625f.xxx;
-    bool3 _132 = bool3(_131.x == 0.0f.xxx.x, _131.y == 0.0f.xxx.y, _131.z == 0.0f.xxx.z);
-    float3 _134 = pow(abs(_131), 0.1593017578125f.xxx);
-    float3 _135 = float3(_132.x ? 0.0f.xxx.x : _134.x, _132.y ? 0.0f.xxx.y : _134.y, _132.z ? 0.0f.xxx.z : _134.z);
-    _4 = float4(_7.SampleLevel(_8, clamp(pow(abs((0.8359375f.xxx + (_135 * 18.8515625f)) / (1.0f.xxx + (_135 * 18.6875f))), 78.84375f.xxx), 0.0f.xxx, 1.0f.xxx), 0.0f).xyz, 1.0f);
+    float3 graded = lerp(_68.xyz, float3(_121.x ? _123.x : _125.x, _121.y ? _123.y : _125.y, _121.z ? _123.z : _125.z), _5_m3.xxx);
+    if (RENODX_COLOR_GRADE_STRENGTH != 1.f) {
+        float3 ungraded = renodx::color::ap1::from::BT709(graded);
+        float3 pq = renodx::color::pq::EncodeSafe(graded, 45.f);
+        float3 lut_result = _7.SampleLevel(_8, pq, 0.0f).xyz;
+        _4 = float4(lerp(ungraded, lut_result, RENODX_COLOR_GRADE_STRENGTH), 1.0f);
+    } else {
+        float3 pq = renodx::color::pq::EncodeSafe(graded, 45.f);
+        _4 = float4(_7.SampleLevel(_8, pq, 0.0f).xyz, 1.0f);
+    }
 }
 
 SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)

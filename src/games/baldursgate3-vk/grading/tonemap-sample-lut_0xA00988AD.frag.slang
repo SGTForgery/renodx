@@ -1,4 +1,6 @@
 
+#include "../shared.h"
+#include "../common.hlsli"
 
 [[vk::binding(0, 1)]]
 cbuffer _9_5 : register(b0, space1)
@@ -36,6 +38,21 @@ void frag_main()
     float3 _150;
     if (_5_m2 >= 20)
     {
+        // z==21 UI character: bypass desaturation, LUT, and all intermediate processing
+        if (RENODX_TONE_MAP_TYPE != 0.f && _5_m2 == 21) {
+            float3 color = max(0, _84);
+            color = ApplyUICharacterGrading(color);
+            color = renodx::color::bt2020::from::BT709(color);
+            if (RENODX_TONE_MAP_TYPE == 2.f) {
+                color = renodx::tonemap::neutwo::MaxChannel(color, RENODX_PEAK_WHITE_NITS / RENODX_GRAPHICS_WHITE_NITS, 100.f);
+            }
+            color = renodx::color::bt709::from::BT2020(color);
+            color = renodx::color::srgb::EncodeSafe(color);
+            color = ApplyUICharacterReGrading(color);
+            _4 = float4(color, 1);
+            return;
+        }
+
         float3 _123;
         [branch]
         if (_5_m2 == 21)
@@ -66,13 +83,62 @@ void frag_main()
     }
     else
     {
-        float3 _138 = (_84 * (10000.0f / _5_m1).xxx) * 9.9999997473787516355514526367188e-05f.xxx;
-        bool3 _139 = bool3(_138.x == 0.0f.xxx.x, _138.y == 0.0f.xxx.y, _138.z == 0.0f.xxx.z);
-        float3 _141 = pow(abs(_138), 0.1593017578125f.xxx);
-        float3 _142 = float3(_139.x ? 0.0f.xxx.x : _141.x, _139.y ? 0.0f.xxx.y : _141.y, _139.z ? 0.0f.xxx.z : _141.z);
-        _150 = pow(abs((0.8359375f.xxx + (_142 * 18.8515625f)) / (1.0f.xxx + (_142 * 18.6875f))), 78.84375f.xxx);
+        _150 = renodx::color::pq::EncodeSafe(_84, 10000.f / _5_m1);
     }
-    _4 = lerp(float4(_7.SampleLevel(_8, _150, 0.0f).xyz, 1.0f), float4(0.0f, 0.0f, 0.0f, 1.0f), _5_m0.xxxx);
+    float3 lut_output = _7.SampleLevel(_8, _150, 0.0f).xyz;
+
+    if (RENODX_TONE_MAP_TYPE != 0.f) {
+        lut_output = renodx::color::pq::DecodeSafe(lut_output, 100.f);
+
+        lut_output = renodx::color::bt709::from::BT2020(lut_output);
+
+        if (RENODX_CUSTOM_CURVE > 0.f) {
+            lut_output = SplitContrast(lut_output, 1.f + RENODX_CUSTOM_CURVE * 0.5f, 1.f, 0.18f);
+            lut_output *= 0.16f / 0.18f;
+        }
+
+        //lut_output = GamutCompress(lut_output);
+        
+        if (RENODX_GAMMA_CORRECTION == 0.f) {
+            lut_output = GammaCorrectHuePreserving(lut_output, true);
+        }
+
+        float3 pre_tonemap_bt709 = lut_output;
+
+        lut_output = PsychoGrade(lut_output);
+        lut_output = renodx::color::bt2020::from::BT709(lut_output);
+
+        if (RENODX_HUE_CORRECTION > 0.f) {
+            float3 tonemapped_bt709 = renodx::color::bt709::from::BT2020(lut_output);
+            float peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+            float3 hue_ref = renodx::tonemap::neutwo::PerChannel(
+                max(0, pre_tonemap_bt709), peak.xxx);
+            tonemapped_bt709 = CorrectHueAndPurityMBGated(tonemapped_bt709, hue_ref, RENODX_HUE_CORRECTION, 0.5f, 1.f, 0.f);
+            lut_output = renodx::color::bt2020::from::BT709(tonemapped_bt709);
+        }
+        {
+            float peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
+            float knee = peak * 0.85f;
+            float max_c = max(lut_output.r, max(lut_output.g, lut_output.b));
+            if (max_c > knee) {
+                float compressed = knee + (peak - knee) * (1.f - exp(-(max_c - knee) / (peak - knee)));
+                lut_output *= compressed / max_c;
+            }
+        }
+
+        if (RENODX_CUSTOM_GRAIN_STRENGTH > 0) {
+            uint2 screen_size;
+            _6.GetDimensions(screen_size.x, screen_size.y);
+            lut_output = renodx::effects::ApplyFilmGrain(
+                lut_output,
+                gl_FragCoord.xy / float2(screen_size),
+                RENODX_CUSTOM_RANDOM,
+                RENODX_CUSTOM_GRAIN_STRENGTH * 0.03f);
+        }
+        lut_output = renodx::color::pq::EncodeSafe(lut_output, RENODX_DIFFUSE_WHITE_NITS);
+    }
+
+    _4 = lerp(float4(lut_output, 1.0f), float4(0.0f, 0.0f, 0.0f, 1.0f), _5_m0.xxxx);
 }
 
 SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)

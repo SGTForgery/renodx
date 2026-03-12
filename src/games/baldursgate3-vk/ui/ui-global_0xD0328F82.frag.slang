@@ -1,4 +1,5 @@
 
+#include "../shared.h"
 
 [[vk::binding(0, 1)]]
 cbuffer _9_8 : register(b0, space1)
@@ -43,36 +44,33 @@ void frag_main()
     {
         float4 _174;
         if (_80 == 1.0f)
-        {
-            float3 _96 = _79.xyz;
-            float3 _97 = _96 * 0.077399380505084991455078125f.xxx;
-            float3 _101 = pow(abs(_96 + 0.054999999701976776123046875f.xxx) * 0.947867333889007568359375f.xxx, 2.400000095367431640625f.xxx);
-            bool3 _102 = bool3(_96.x <= 0.040449999272823333740234375f.xxx.x, _96.y <= 0.040449999272823333740234375f.xxx.y, _96.z <= 0.040449999272823333740234375f.xxx.z);
-            float3 _108 = (mul(float3x3(float3(0.627399981021881103515625f, 0.329299986362457275390625f, 0.0432999990880489349365234375f), float3(0.069099999964237213134765625f, 0.91949999332427978515625f, 0.011400000192224979400634765625f), float3(0.01640000008046627044677734375f, 0.087999999523162841796875f, 0.895600020885467529296875f)), float3(_102.x ? _97.x : _101.x, _102.y ? _97.y : _101.y, _102.z ? _97.z : _101.z)) * _8_m0) * 9.9999997473787516355514526367188e-05f.xxx;
-            bool3 _109 = bool3(_108.x == 0.0f.xxx.x, _108.y == 0.0f.xxx.y, _108.z == 0.0f.xxx.z);
-            float3 _111 = pow(abs(_108), 0.1593017578125f.xxx);
-            float3 _112 = float3(_109.x ? 0.0f.xxx.x : _111.x, _109.y ? 0.0f.xxx.y : _111.y, _109.z ? 0.0f.xxx.z : _111.z);
-            _174 = float4(pow(abs((0.8359375f.xxx + (_112 * 18.8515625f)) / (1.0f.xxx + (_112 * 18.6875f))), 78.84375f.xxx), 1.0f);
+        {  // most UI elements
+            float3 decoded;
+            if (!RENODX_GAMMA_CORRECTION) {
+                decoded = renodx::color::srgb::DecodeSafe(_79.xyz);
+            } else {
+                decoded = renodx::color::gamma::DecodeSafe(_79.xyz, 2.2f);
+            }
+            float3 bt2020 = renodx::color::bt2020::from::BT709(decoded);
+            _174 = float4(renodx::color::pq::EncodeSafe(bt2020, RENODX_GRAPHICS_WHITE_NITS), 1.0f);
         }
         else
-        {
-            float3 _127 = _5.SampleLevel(_7, _3, 0.0f).xyz;
-            bool3 _128 = bool3(_127.x == 0.0f.xxx.x, _127.y == 0.0f.xxx.y, _127.z == 0.0f.xxx.z);
-            float3 _130 = pow(abs(_127), 0.0126833133399486541748046875f.xxx);
-            float3 _131 = float3(_128.x ? 0.0f.xxx.x : _130.x, _128.y ? 0.0f.xxx.y : _130.y, _128.z ? 0.0f.xxx.z : _130.z);
-            float3 _136 = max(_131 - 0.8359375f.xxx, 0.0f.xxx) / (18.8515625f.xxx - (_131 * 18.6875f));
-            bool3 _137 = bool3(_136.x == 0.0f.xxx.x, _136.y == 0.0f.xxx.y, _136.z == 0.0f.xxx.z);
-            float3 _140 = pow(abs(_136), 6.277394771575927734375f.xxx) * 10000.0f;
-            float3 _142 = _80.xxx;
-            float3 _144 = _79.xyz;
-            float3 _145 = _144 * 0.077399380505084991455078125f.xxx;
-            float3 _149 = pow(abs(_144 + 0.054999999701976776123046875f.xxx) * 0.947867333889007568359375f.xxx, 2.400000095367431640625f.xxx);
-            bool3 _150 = bool3(_144.x <= 0.040449999272823333740234375f.xxx.x, _144.y <= 0.040449999272823333740234375f.xxx.y, _144.z <= 0.040449999272823333740234375f.xxx.z);
-            float3 _158 = ((mul(float3x3(float3(0.627399981021881103515625f, 0.329299986362457275390625f, 0.0432999990880489349365234375f), float3(0.069099999964237213134765625f, 0.91949999332427978515625f, 0.011400000192224979400634765625f), float3(0.01640000008046627044677734375f, 0.087999999523162841796875f, 0.895600020885467529296875f)), float3(_150.x ? _145.x : _149.x, _150.y ? _145.y : _149.y, _150.z ? _145.z : _149.z)) * _8_m0) + lerp(lerp(float3(_137.x ? 0.0f.xxx.x : _140.x, _137.y ? 0.0f.xxx.y : _140.y, _137.z ? 0.0f.xxx.z : _140.z), 0.0f.xxx, _142), 0.0f.xxx, _142)) * 9.9999997473787516355514526367188e-05f.xxx;
-            bool3 _159 = bool3(_158.x == 0.0f.xxx.x, _158.y == 0.0f.xxx.y, _158.z == 0.0f.xxx.z);
-            float3 _161 = pow(abs(_158), 0.1593017578125f.xxx);
-            float3 _162 = float3(_159.x ? 0.0f.xxx.x : _161.x, _159.y ? 0.0f.xxx.y : _161.y, _159.z ? 0.0f.xxx.z : _161.z);
-            _174 = float4(pow(abs((0.8359375f.xxx + (_162 * 18.8515625f)) / (1.0f.xxx + (_162 * 18.6875f))), 78.84375f.xxx), 1.0f);
+        {  // some other UI elements
+            float3 bg = renodx::color::pq::DecodeSafe(_5.SampleLevel(_7, _3, 0.0f).xyz, 1.f);
+            bg = bg - _80 * bg;  // bg * (1 - alpha)
+
+            float3 overlay_decoded;
+            if (!RENODX_GAMMA_CORRECTION) {
+                overlay_decoded = renodx::color::srgb::DecodeSafe(_79.xyz);
+            } else {
+                overlay_decoded = renodx::color::gamma::DecodeSafe(_79.xyz, 2.2f);
+            }
+
+            float3 overlay_bt2020 = renodx::color::bt2020::from::BT709(overlay_decoded);
+            float3 composited = bg - _80 * bg;  // bg * (1 - alpha)^2
+            composited = overlay_bt2020 * RENODX_GRAPHICS_WHITE_NITS + composited;
+
+            _174 = float4(renodx::color::pq::EncodeSafe(composited, 1.f), 1.0f);
         }
         _175 = _174;
     }

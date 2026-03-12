@@ -15,7 +15,9 @@
 
 #include "../../mods/shader.hpp"
 #include "../../utils/date.hpp"
+#include "../../utils/resource_upgrade.hpp"
 #include "../../utils/settings.hpp"
+#include "../../utils/random.hpp"
 #include "./shared.h"
 
 namespace {
@@ -66,18 +68,6 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off", "2.2"},
     },
     new renodx::utils::settings::Setting{
-        .key = "ToneMapMethod",
-        .binding = &shader_injection.tone_map_method,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
-        .label = "Tone Map Method",
-        .section = "Tone Mapping",
-        .tooltip = "Selects the tonemapping algorithm",
-        .labels = {"MaxChannel Neutwo", "Psycho"},
-        .max = 1.f,
-        //.is_visible = []() { return false; },
-    },
-    new renodx::utils::settings::Setting{
         .key = "ColorGradeHueShift",
         .binding = &shader_injection.tone_map_hue_shift,
         .default_value = 25.f,
@@ -86,7 +76,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Hue-shift emulation strength",
         .max = 100.f,
         .parse = [](float value) { return value * 0.02f; },
-        //.is_visible = []() { return false; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeBlowout",
@@ -97,7 +87,7 @@ renodx::utils::settings::Settings settings = {
         .tooltip = "Chrominance blowout emulation strength",
         .max = 100.f,
         .parse = [](float value) { return value * 0.02f; },
-        //.is_visible = []() { return false; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeExposure",
@@ -185,6 +175,74 @@ renodx::utils::settings::Settings settings = {
         .max = 100.f,
         .parse = [](float value) { return value * 0.01f; },
     },
+    new renodx::utils::settings::Setting{
+        .key = "CustomCurve",
+        .binding = &shader_injection.custom_curve,
+        .default_value = 50.f,
+        .label = "Custom Curve",
+        .section = "Color Grading",
+        .tooltip = "Applies a contrast curve to compensate for skipped ACES tonemapping",
+        .max = 100.f,
+        .parse = [](float value) { return value * 0.02f; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "HueCorrection",
+        .binding = &shader_injection.hue_correction,
+        .default_value = 100.f,
+        .label = "Hue Correction",
+        .section = "Color Grading",
+        .tooltip = "Hue and purity correction strength via MacLeod-Boynton",
+        .max = 100.f,
+        .parse = [](float value) { return value * 0.02f; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting({
+            .key = "FxBloom",
+            .binding = &shader_injection.custom_bloom,
+            .default_value = 50.f,
+            .label = "Bloom Strength",
+            .section = "Effects",
+            .parse = [](float value) { return value * 0.02f; },
+        }),
+    new renodx::utils::settings::Setting({
+            .key = "FxGrainStrength",
+            .binding = &shader_injection.custom_grain_strength,
+            .default_value = 0.f,
+            .label = "Perceptual Grain Strength",
+            .section = "Effects",
+            .parse = [](float value) { return value * 0.01f; },
+        }),
+    new renodx::utils::settings::Setting({
+            .key = "RenderingMultiScatter",
+            .binding = &shader_injection.rendering_multi_scatter,
+            .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+            .default_value = 0.f,
+            .label = "Multi-Scatter GGX",
+            .section = "Rendering",
+            .tooltip = "Adds Kulla-Conty energy compensation to specular GGX. Recovers lost energy on rough metals.",
+            .labels = {"Off", "On"},
+        }),
+    new renodx::utils::settings::Setting({
+            .key = "RenderingCubemapMod",
+            .binding = &shader_injection.rendering_cubemap_mod,
+            .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+            .default_value = 0.f,
+            .label = "IBL Modulation",
+            .section = "Rendering",
+            .tooltip = "Gates IBL reflections by sky irradiance luminance. Dims reflections in dark/shadowed environments.",
+            .labels = {"Off", "On"},
+        }),
+    new renodx::utils::settings::Setting({
+            .key = "RenderingAODirect",
+            .binding = &shader_injection.rendering_ao_direct,
+            .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+            .default_value = 0.f,
+            .label = "AO on Direct Lights",
+            .section = "Rendering",
+            .tooltip = "Applies ambient occlusion to local light contributions, reducing light leak.",
+            .labels = {"Off", "On"},
+        }),
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
         .label = "Reset All",
@@ -277,22 +335,160 @@ void OnPresetOff() {
       {"ToneMapGameNits", 225.f},
       {"ToneMapUINits", 300.f},
       {"ToneMapGammaCorrection", 0},
-      {"ColorGradeExposure", 1.f},
-      {"ColorGradeHighlights", 50.f},
+      {"ColorGradeExposure", 0.85f},
+      {"ColorGradeHighlights", 49.f},
       {"ColorGradeShadows", 50.f},
       {"ColorGradeContrast", 50.f},
-      {"ColorGradeSaturation", 100.f},
+      {"ColorGradeSaturation", 50.f},
       {"ColorGradeHighlightSaturation", 50.f},
-      {"ColorGradeDechroma", 90.f},
+      {"ColorGradeDechroma", 0.f},
       {"ColorGradeFlare", 0.f},
       {"ColorGradeScene", 100.f},
       {"ColorGradeHueShift", 0.f},
       {"ColorGradeBlowout", 0.f},
-      {"ToneMapMethod", 0.f},
+      {"CustomCurve", 50.f},
+      {"HueCorrection", 0.f},
+      {"FxGrainStrength", 0.f},
+      {"RenderingMultiScatter", 0.f},
+      {"RenderingCubemapMod", 0.f},
+      {"RenderingAODirect", 0.f},
   });
 }
 
 bool initialized = false;
+
+void OnInitDevice(reshade::api::device* device) {
+  const auto target_format = reshade::api::format::r16g16b16a16_float;
+  const auto view_upgrades = renodx::utils::resource::VIEW_UPGRADES_RGBA16F;
+
+  const renodx::utils::resource::ResourceUpgradeInfo::Dimensions portrait_dim = {
+      .width = 1400,
+      .height = 1380,
+      .depth = renodx::utils::resource::ResourceUpgradeInfo::ANY,
+  };
+  const renodx::utils::resource::ResourceUpgradeInfo::Dimensions portrait_dim2 = {
+      .width = 828,
+      .height = 1080,
+      .depth = renodx::utils::resource::ResourceUpgradeInfo::ANY,
+  };
+  const renodx::utils::resource::ResourceUpgradeInfo::Dimensions portrait_dim3 = {
+      .width = 645,
+      .height = 913,
+      .depth = renodx::utils::resource::ResourceUpgradeInfo::ANY,
+  };
+  const renodx::utils::resource::ResourceUpgradeInfo::Dimensions backbuffer_dim = {
+      .width = renodx::utils::resource::ResourceUpgradeInfo::BACK_BUFFER,
+      .height = renodx::utils::resource::ResourceUpgradeInfo::BACK_BUFFER,
+      .depth = renodx::utils::resource::ResourceUpgradeInfo::ANY,
+  };
+
+  std::vector<renodx::utils::resource::ResourceUpgradeInfo> upgrade_infos = {
+      // Fullscreen r8g8b8a8 UI RTs — back buffer resolution exact match
+      {
+          .old_format = reshade::api::format::r8g8b8a8_typeless,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = backbuffer_dim,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      {
+          .old_format = reshade::api::format::r8g8b8a8_unorm,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = backbuffer_dim,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      // UI character portrait RT — 1400x1380 (~1:1, excluded by aspect filter above)
+      {
+          .old_format = reshade::api::format::r8g8b8a8_typeless,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      {
+          .old_format = reshade::api::format::r8g8b8a8_unorm,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      {
+          .old_format = reshade::api::format::r10g10b10a2_typeless,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      {
+          .old_format = reshade::api::format::r10g10b10a2_unorm,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      // UI character portrait RT — 828x1080
+      {
+          .old_format = reshade::api::format::r8g8b8a8_typeless,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim2,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      {
+          .old_format = reshade::api::format::r8g8b8a8_unorm,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim2,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      {
+          .old_format = reshade::api::format::r10g10b10a2_typeless,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim2,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      {
+          .old_format = reshade::api::format::r10g10b10a2_unorm,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim2,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      // UI character portrait RT — 645x913
+      {
+          .old_format = reshade::api::format::r8g8b8a8_typeless,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim3,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      {
+          .old_format = reshade::api::format::r8g8b8a8_unorm,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim3,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      {
+          .old_format = reshade::api::format::r10g10b10a2_typeless,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim3,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+      {
+          .old_format = reshade::api::format::r10g10b10a2_unorm,
+          .new_format = target_format,
+          .view_upgrades = view_upgrades,
+          .dimensions = portrait_dim3,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
+  };
+
+  renodx::utils::resource::upgrade::SetUpgradeInfos(device, upgrade_infos);
+}
 
 }  // namespace
 
@@ -303,14 +499,26 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
   switch (fdw_reason) {
     case DLL_PROCESS_ATTACH:
       if (!reshade::register_addon(h_module)) return FALSE;
+
+      renodx::mods::shader::allow_multiple_push_constants = true;
+      renodx::mods::shader::expand_existing_constant_buffer = true;
+      renodx::mods::shader::minimum_constant_buffer_stages = reshade::api::shader_stage::pixel | reshade::api::shader_stage::compute;
+
+      renodx::utils::resource::upgrade::Use(fdw_reason);
+      reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+
       break;
     case DLL_PROCESS_DETACH:
+      renodx::utils::resource::upgrade::Use(fdw_reason);
+      reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
       reshade::unregister_addon(h_module);
       break;
   }
 
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
+  renodx::utils::random::binds.push_back(&shader_injection.custom_random);
+  renodx::utils::random::Use(fdw_reason);
 
   return TRUE;
 }

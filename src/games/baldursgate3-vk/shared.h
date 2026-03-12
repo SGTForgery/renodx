@@ -21,7 +21,15 @@ struct ShaderInjectData {
   float color_grade_strength;
   float tone_map_hue_shift;
   float tone_map_blowout;
-  float tone_map_method;
+  float custom_curve;
+  float hue_correction;
+  float custom_random;
+  float custom_grain_strength;
+  float custom_bloom;
+  float rendering_multi_scatter;
+  float rendering_cubemap_mod;
+  float rendering_ao_direct;
+  float _pad0;
 };
 
 #ifndef __cplusplus
@@ -69,7 +77,14 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_COLOR_GRADE_STRENGTH          shader_injection.color_grade_strength
 #define RENODX_TONE_MAP_HUE_SHIFT            shader_injection.tone_map_hue_shift
 #define RENODX_TONE_MAP_BLOWOUT              shader_injection.tone_map_blowout
-#define RENODX_TONE_MAP_METHOD               shader_injection.tone_map_method
+#define RENODX_CUSTOM_CURVE                  shader_injection.custom_curve
+#define RENODX_HUE_CORRECTION                shader_injection.hue_correction
+#define RENODX_CUSTOM_RANDOM                 shader_injection.custom_random
+#define RENODX_CUSTOM_GRAIN_STRENGTH         shader_injection.custom_grain_strength
+#define RENODX_CUSTOM_BLOOM                  shader_injection.custom_bloom
+#define RENODX_RENDERING_MULTI_SCATTER       shader_injection.rendering_multi_scatter
+#define RENODX_RENDERING_CUBEMAP_MOD         shader_injection.rendering_cubemap_mod
+#define RENODX_RENDERING_AO_DIRECT           shader_injection.rendering_ao_direct
 
 #include "../../shaders/renodx.hlsl"
 
