@@ -310,7 +310,9 @@ layout(push_constant) uniform RenoDXPushConstants {
     float rendering_multi_scatter;      // 80
     float rendering_cubemap_mod;        // 84
     float rendering_ao_direct;          // 88
-    float _pad0;                        // 92
+    float rendering_shadow_improvements; // 92
+    float rendering_micro_shadows;       // 96
+    float rendering_micro_shadows_debug; // 100
 } pc;
 
 spirv_instruction(set = "GLSL.std.450", id = 79) float spvNMin(float, float);
@@ -328,6 +330,32 @@ float rdx_cubemap_modulation(vec3 skyLight, float roughness) {
     float mod_factor = smoothstep(0.0, 0.25, skyLum)
                      * mix(0.5, 1.0, clamp(roughness, 0.0, 1.0));
     return mix(0.3, 1.0, mod_factor);
+}
+
+// --- RenoDX: Depth-Bias Micro Detail Shadow (Bend Studio technique) ---
+float rdx_micro_shadow_march(
+    texture2D depthTex, sampler samp,
+    vec2 pixelUV, vec2 marchDir,
+    float originDepth, vec2 viewportSize)
+{
+    ivec2 baseCoord = ivec2(pixelUV * viewportSize);
+    ivec2 vpSize = ivec2(viewportSize);
+    float thickness = max(originDepth * 0.005, 0.0004);
+    float occlusion = 0.0;
+    for (int i = 1; i <= 16; i++) {
+        ivec2 samplePos = baseCoord + ivec2(round(marchDir * 2.0 * float(i)));
+        if (any(lessThan(samplePos, ivec2(0))) || any(greaterThanEqual(samplePos, vpSize)))
+            break;
+        float sd = texelFetch(sampler2D(depthTex, samp), samplePos, 0).x;
+        float dd = originDepth - sd;
+        if (dd > 0.0 && dd < thickness) {
+            float depthWeight = smoothstep(0.0, thickness * 0.2, dd)
+                              * (1.0 - smoothstep(thickness * 0.7, thickness, dd));
+            float distFade = 1.0 - float(i) / 17.0;
+            occlusion = max(occlusion, depthWeight * distFade);
+        }
+    }
+    return 1.0 - occlusion * 0.5;
 }
 
 void main()
@@ -1730,15 +1758,7 @@ void main()
         {
             _3206 = _26._m2;
         }
-        float _3219;
-        if (_34._m0.w > 0.0)
-        {
-            _3219 = texelFetch(_41, ivec3(int(_612), int(_613), 0).xy, 0).x;
-        }
-        else
-        {
-            _3219 = 1.0;
-        }
+        float _3219 = texelFetch(_41, ivec3(int(_612), int(_613), 0).xy, 0).x;
         float _3304;
         SPIRV_CROSS_BRANCH
         if (_26._m21 > 0.0)
@@ -1818,6 +1838,23 @@ void main()
         }
         vec3 _3577 = (fma(_3396, (sqrt(_570) * ((0.3183098733425140380859375 * mix(clamp((dot(_568, _26._m0) + 1.0) * 0.25, 0.0, 1.0), 1.0 - abs(_3399), 0.3300000131130218505859375)) * _567)) * pow(spvNMax(abs(_570 / vec3(dot(_570, vec3(0.300000011920928955078125, 0.589999973773956298828125, 0.10999999940395355224609375)))), vec3(9.9999997473787516355514526367188e-05)), vec3(fma(-_3394, _3394, 1.0))), _1662) * mix(1.0, _3569, _34._m0.y)) + ((_2387 * _3140) * _3569);
         vec3 _3579 = (_3548 * mix(1.0, _3568, _34._m0.y)) + ((_2384 * _3140) * _3568);
+        float _rdx_dbg_micro = 1.0;
+        // --- RenoDX: CSM Ambient Shadow Fix (underground/no-CSM areas) ---
+        if (pc.rendering_shadow_improvements > 0.5 && _6._m0[0u] > 0.001) {
+            float _rdx_csm_shadow = mix(1.0, _3219, 0.5);
+            _3577 *= _rdx_csm_shadow;
+            _3579 *= _rdx_csm_shadow;
+        }
+        // --- RenoDX: Micro Shadow Detail (all scenes with sun) ---
+        if (pc.rendering_micro_shadows > 0.5 && _6._m0[0u] > 0.001) {
+            vec3 _rdx_lightView = mat3(_26._m6[0].xyz, _26._m6[1].xyz, _26._m6[2].xyz) * _26._m0;
+            vec2 _rdx_marchDir = normalize(vec2(_rdx_lightView.x, -_rdx_lightView.y));
+            float _rdx_micro = rdx_micro_shadow_march(
+                _39, _7, _456, _rdx_marchDir, _498, vec2(_34._m1));
+            _rdx_dbg_micro = _rdx_micro;
+            _3577 *= _rdx_micro;
+            _3579 *= _rdx_micro;
+        }
         vec3 _4084;
         vec3 _4085;
         SPIRV_CROSS_BRANCH
@@ -1994,6 +2031,17 @@ void main()
         {
             _4084 = _3579;
             _4085 = _3577;
+        }
+        // --- RenoDX: Micro Shadow Debug View ---
+        if (pc.rendering_micro_shadows_debug > 0.5) {
+            vec3 _rdx_lv = mat3(_26._m6[0].xyz, _26._m6[1].xyz, _26._m6[2].xyz) * _26._m0;
+            vec2 _rdx_raw = vec2(_rdx_lv.x, -_rdx_lv.y);
+            float _rdx_len = length(_rdx_raw);
+            vec2 _rdx_dir = (_rdx_len > 0.0001) ? (_rdx_raw / _rdx_len) : vec2(1.0, 0.0);
+            float _rdx_v = rdx_micro_shadow_march(_39, _7, _456, _rdx_dir, _498, vec2(_34._m1));
+            float _rdx_vis = clamp((_rdx_v - 0.5) * 2.0, 0.0, 1.0);
+            _4085 = vec3(_rdx_vis);
+            _4084 = vec3(0.0);
         }
         imageStore(_43, ivec2(_439), vec4(_4085, 1.0));
         imageStore(_44, ivec2(_439), vec4(_4084, 1.0));

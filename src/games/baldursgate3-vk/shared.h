@@ -29,7 +29,9 @@ struct ShaderInjectData {
   float rendering_multi_scatter;
   float rendering_cubemap_mod;
   float rendering_ao_direct;
-  float _pad0;
+  float rendering_shadow_improvements;
+  float rendering_micro_shadows;
+  float rendering_micro_shadows_debug;
 };
 
 #ifndef __cplusplus
@@ -85,6 +87,9 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_RENDERING_MULTI_SCATTER       shader_injection.rendering_multi_scatter
 #define RENODX_RENDERING_CUBEMAP_MOD         shader_injection.rendering_cubemap_mod
 #define RENODX_RENDERING_AO_DIRECT           shader_injection.rendering_ao_direct
+#define RENODX_RENDERING_SHADOW_IMPROVEMENTS shader_injection.rendering_shadow_improvements
+#define RENODX_RENDERING_MICRO_SHADOWS           shader_injection.rendering_micro_shadows
+#define RENODX_RENDERING_MICRO_SHADOWS_DEBUG    shader_injection.rendering_micro_shadows_debug
 
 #include "../../shaders/renodx.hlsl"
 

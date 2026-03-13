@@ -222,6 +222,7 @@ renodx::utils::settings::Settings settings = {
             .section = "Rendering",
             .tooltip = "Adds Kulla-Conty energy compensation to specular GGX. Recovers lost energy on rough metals.",
             .labels = {"Off", "On"},
+            .is_visible = []() { return false; },
         }),
     new renodx::utils::settings::Setting({
             .key = "RenderingCubemapMod",
@@ -242,6 +243,36 @@ renodx::utils::settings::Settings settings = {
             .section = "Rendering",
             .tooltip = "Applies ambient occlusion to local light contributions, reducing light leak.",
             .labels = {"Off", "On"},
+        }),
+    new renodx::utils::settings::Setting({
+            .key = "RenderingShadowImprovements",
+            .binding = &shader_injection.rendering_shadow_improvements,
+            .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+            .default_value = 0.f,
+            .label = "Shadow Improvements",
+            .section = "Rendering",
+            .tooltip = "Applies CSM shadow data to ambient/indirect lighting in areas where the engine skips it (e.g. Grymforge).",
+            .labels = {"Off", "On"},
+        }),
+    new renodx::utils::settings::Setting({
+            .key = "RenderingMicroShadows",
+            .binding = &shader_injection.rendering_micro_shadows,
+            .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+            .default_value = 0.f,
+            .label = "Micro Detail Shadows",
+            .section = "Rendering",
+            .tooltip = "Adds fine micro-detail shadows via depth-bias ray marching (Bend Studio technique). Enhances contact shadows from subtle geometry.",
+            .labels = {"Off", "On"},
+        }),
+    new renodx::utils::settings::Setting({
+            .key = "RenderingMicroShadowsDebug",
+            .binding = &shader_injection.rendering_micro_shadows_debug,
+            .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+            .default_value = 0.f,
+            .label = "Micro Shadows Debug View",
+            .section = "Rendering",
+            .labels = {"Off", "On"},
+            .is_visible = []() { return false; },
         }),
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -352,6 +383,9 @@ void OnPresetOff() {
       {"RenderingMultiScatter", 0.f},
       {"RenderingCubemapMod", 0.f},
       {"RenderingAODirect", 0.f},
+      {"RenderingShadowImprovements", 0.f},
+      {"RenderingMicroShadows", 0.f},
+      {"RenderingMicroShadowsDebug", 0.f},
   });
 }
 

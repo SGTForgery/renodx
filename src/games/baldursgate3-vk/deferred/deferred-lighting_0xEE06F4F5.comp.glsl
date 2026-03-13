@@ -286,6 +286,35 @@ layout(set = 1, binding = 7) uniform texture2D _41;
 layout(set = 1, binding = 10, rgba32f) uniform writeonly image2D _43;
 layout(set = 1, binding = 11, rgba32f) uniform writeonly image2D _44;
 
+layout(push_constant) uniform RenoDXPushConstants {
+    float peak_white_nits;              // 0
+    float diffuse_white_nits;           // 4
+    float graphics_white_nits;          // 8
+    float gamma_correction;             // 12
+    float tone_map_exposure;            // 16
+    float tone_map_highlights;          // 20
+    float tone_map_shadows;             // 24
+    float tone_map_contrast;            // 28
+    float tone_map_saturation;          // 32
+    float tone_map_highlight_saturation;// 36
+    float tone_map_dechroma;            // 40
+    float tone_map_flare;               // 44
+    float color_grade_strength;         // 48
+    float tone_map_hue_shift;           // 52
+    float tone_map_blowout;             // 56
+    float custom_curve;                 // 60
+    float hue_correction;               // 64
+    float custom_random;                // 68
+    float custom_grain_strength;        // 72
+    float custom_bloom;                 // 76
+    float rendering_multi_scatter;      // 80
+    float rendering_cubemap_mod;        // 84
+    float rendering_ao_direct;          // 88
+    float rendering_shadow_improvements; // 92
+    float rendering_micro_shadows;       // 96
+    float rendering_micro_shadows_debug; // 100
+} pc;
+
 spirv_instruction(set = "GLSL.std.450", id = 79) float spvNMin(float, float);
 spirv_instruction(set = "GLSL.std.450", id = 79) vec2 spvNMin(vec2, vec2);
 spirv_instruction(set = "GLSL.std.450", id = 79) vec3 spvNMin(vec3, vec3);
@@ -294,6 +323,35 @@ spirv_instruction(set = "GLSL.std.450", id = 80) float spvNMax(float, float);
 spirv_instruction(set = "GLSL.std.450", id = 80) vec2 spvNMax(vec2, vec2);
 spirv_instruction(set = "GLSL.std.450", id = 80) vec3 spvNMax(vec3, vec3);
 spirv_instruction(set = "GLSL.std.450", id = 80) vec4 spvNMax(vec4, vec4);
+
+// --- RenoDX: Depth-Bias Micro Detail Shadow (Bend Studio technique) ---
+// Screen-space ray march with thickness-windowed depth comparison.
+// Captures micro-detail shadowing from subtle depth buffer variations
+// that CSM resolution misses (brick grooves, armor edges, terrain bumps).
+float rdx_micro_shadow_march(
+    texture2D depthTex, sampler samp,
+    vec2 pixelUV, vec2 marchDir,
+    float originDepth, vec2 viewportSize)
+{
+    ivec2 baseCoord = ivec2(pixelUV * viewportSize);
+    ivec2 vpSize = ivec2(viewportSize);
+    float thickness = max(originDepth * 0.005, 0.0004);
+    float occlusion = 0.0;
+    for (int i = 1; i <= 16; i++) {
+        ivec2 samplePos = baseCoord + ivec2(round(marchDir * 2.0 * float(i)));
+        if (any(lessThan(samplePos, ivec2(0))) || any(greaterThanEqual(samplePos, vpSize)))
+            break;
+        float sd = texelFetch(sampler2D(depthTex, samp), samplePos, 0).x;
+        float dd = originDepth - sd;
+        if (dd > 0.0 && dd < thickness) {
+            float depthWeight = smoothstep(0.0, thickness * 0.2, dd)
+                              * (1.0 - smoothstep(thickness * 0.7, thickness, dd));
+            float distFade = 1.0 - float(i) / 17.0;
+            occlusion = max(occlusion, depthWeight * distFade);
+        }
+    }
+    return 1.0 - occlusion * 0.5;
+}
 
 void main()
 {
@@ -525,6 +583,14 @@ void main()
                         _850 = _627;
                         _851 = _630;
                         _852 = _715;
+                    }
+                    // --- RenoDX: Per-Light Micro Shadow ---
+                    if (pc.rendering_micro_shadows > 0.5 && _852 > 0.0) {
+                        vec3 _rdx_pl_lv = mat3(_26._m6[0].xyz, _26._m6[1].xyz, _26._m6[2].xyz) * normalize(_676);
+                        vec2 _rdx_pl_md = normalize(vec2(_rdx_pl_lv.x, -_rdx_pl_lv.y));
+                        float _rdx_pl_ms = rdx_micro_shadow_march(
+                            _39, _7, _404, _rdx_pl_md, _446, vec2(_34._m1));
+                        _852 *= _rdx_pl_ms;
                     }
                     vec3 _1021;
                     vec3 _1022;
@@ -1466,15 +1532,7 @@ void main()
         {
             _2458 = _26._m2;
         }
-        float _2471;
-        if (_34._m0.w > 0.0)
-        {
-            _2471 = texelFetch(_41, ivec3(int(_594), int(_595), 0).xy, 0).x;
-        }
-        else
-        {
-            _2471 = 1.0;
-        }
+        float _2471 = texelFetch(_41, ivec3(int(_594), int(_595), 0).xy, 0).x;
         float _2556;
         SPIRV_CROSS_BRANCH
         if (_26._m21 > 0.0)
@@ -1547,6 +1605,23 @@ void main()
         }
         vec3 _2784 = ((_1424 + ((_2648 * (_487 * (0.3183098733425140380859375 * (((vec3(1.0) + (_2664 * pow(spvNMax(abs(1.0 - _2657), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_2664 * pow(spvNMax(abs(1.0 - _625), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _559))))) * _2657)) * mix(1.0, _2776, _34._m0.y)) + ((_1975 * _2392) * _2776);
         vec3 _2786 = ((_1422 + ((_2648 * ((_492 + ((vec3(1.0) - _492) * pow(spvNMax(abs(1.0 - clamp(dot(_2693, _2695), 0.0, 1.0)), 9.9999997473787516355514526367188e-05), 5.0))) * ((0.5 / fma(_2701, sqrt(fma(fma(-_625, _2713, _625), _625, _2713)), _625 * sqrt(fma(fma(-_2701, _2713, _2701), _2701, _2713)))) * (1.0 / ((((_2730 * _2732) * 3.1415927410125732421875) * _2743) * _2743))))) * _2657)) * mix(1.0, _2775, _34._m0.y)) + ((_1972 * _2392) * _2775);
+        float _rdx_dbg_micro = 1.0;
+        // --- RenoDX: CSM Ambient Shadow Fix (underground/no-CSM areas) ---
+        if (pc.rendering_shadow_improvements > 0.5 && _6._m0[0u] > 0.001) {
+            float _rdx_csm_shadow = mix(1.0, _2646, 0.5);
+            _2784 *= _rdx_csm_shadow;
+            _2786 *= _rdx_csm_shadow;
+        }
+        // --- RenoDX: Micro Shadow Detail (all scenes with sun) ---
+        if (pc.rendering_micro_shadows > 0.5 && _6._m0[0u] > 0.001) {
+            vec3 _rdx_lightView = mat3(_26._m6[0].xyz, _26._m6[1].xyz, _26._m6[2].xyz) * _26._m0;
+            vec2 _rdx_marchDir = normalize(vec2(_rdx_lightView.x, -_rdx_lightView.y));
+            float _rdx_micro = rdx_micro_shadow_march(
+                _39, _7, _404, _rdx_marchDir, _446, vec2(_34._m1));
+            _rdx_dbg_micro = _rdx_micro;
+            _2784 *= _rdx_micro;
+            _2786 *= _rdx_micro;
+        }
         vec3 _3291;
         vec3 _3292;
         SPIRV_CROSS_BRANCH
@@ -1723,6 +1798,17 @@ void main()
         {
             _3291 = _2786;
             _3292 = _2784;
+        }
+        // --- RenoDX: Micro Shadow Debug View ---
+        if (pc.rendering_micro_shadows_debug > 0.5) {
+            vec3 _rdx_lv = mat3(_26._m6[0].xyz, _26._m6[1].xyz, _26._m6[2].xyz) * _26._m0;
+            vec2 _rdx_raw = vec2(_rdx_lv.x, -_rdx_lv.y);
+            float _rdx_len = length(_rdx_raw);
+            vec2 _rdx_dir = (_rdx_len > 0.0001) ? (_rdx_raw / _rdx_len) : vec2(1.0, 0.0);
+            float _rdx_v = rdx_micro_shadow_march(_39, _7, _404, _rdx_dir, _446, vec2(_34._m1));
+            float _rdx_vis = clamp((_rdx_v - 0.5) * 2.0, 0.0, 1.0);
+            _3292 = vec3(_rdx_vis);
+            _3291 = vec3(0.0);
         }
         imageStore(_43, ivec2(_387), vec4(_3292, 1.0));
         imageStore(_44, ivec2(_387), vec4(_3291, 1.0));
