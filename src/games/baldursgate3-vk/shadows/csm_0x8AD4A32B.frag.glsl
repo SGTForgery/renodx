@@ -166,6 +166,36 @@ spirv_instruction(set = "GLSL.std.450", id = 80) vec2 spvNMax(vec2, vec2);
 spirv_instruction(set = "GLSL.std.450", id = 80) vec3 spvNMax(vec3, vec3);
 spirv_instruction(set = "GLSL.std.450", id = 80) vec4 spvNMax(vec4, vec4);
 
+layout(push_constant) uniform RenoDXPushConstants {
+    float peak_white_nits;              // 0
+    float diffuse_white_nits;           // 4
+    float graphics_white_nits;          // 8
+    float gamma_correction;             // 12
+    float tone_map_exposure;            // 16
+    float tone_map_highlights;          // 20
+    float tone_map_shadows;             // 24
+    float tone_map_contrast;            // 28
+    float tone_map_saturation;          // 32
+    float tone_map_highlight_saturation;// 36
+    float tone_map_dechroma;            // 40
+    float tone_map_flare;               // 44
+    float color_grade_strength;         // 48
+    float tone_map_hue_shift;           // 52
+    float tone_map_blowout;             // 56
+    float custom_curve;                 // 60
+    float hue_correction;               // 64
+    float custom_random;                // 68
+    float custom_grain_strength;        // 72
+    float custom_bloom;                 // 76
+    float rendering_multi_scatter;      // 80
+    float rendering_cubemap_mod;        // 84
+    float rendering_ao_direct;          // 88
+    float rendering_shadow_improvements; // 92
+    float rendering_micro_shadows;       // 96
+    float rendering_micro_shadows_debug; // 100
+    float csm_debug;                     // 104
+} pc;
+
 void main()
 {
     int _124 = int(gl_FragCoord.x);
@@ -175,6 +205,9 @@ void main()
     float _130 = _129.x;
     vec3 _131 = _4 * _130;
     float _158 = fma(fract(_6._m2 * 0.25), _6._m3, fma(0.2700000107288360595703125, fma(((_125 & 1) == 0) ? 1.0 : (-1.0), 0.5, ((_124 & 1) == 0) ? 1.0 : (-1.0)) + 1.5, texelFetch(_18, ivec3(ivec2(gl_FragCoord.xy * 0.5) & ivec2(63), 0).xy, 0).x));
+
+    // CSM Diagnostic setup
+    int csmMode = int(pc.csm_debug + 0.5);
     float _159 = _158 * 6.283185482025146484375;
     float _166 = 230.0 / spvNMax(_8._m3, _130 * _8._m4);
     vec3 _167 = dFdxFine(_131);
@@ -182,8 +215,30 @@ void main()
     vec3 _171 = cross(_167, _168) * (_166 * _166);
     vec3 _172 = subgroupQuadSwapDiagonal(_131);
     float _183 = spvNMax(0.0, spvNMin(1.0, fma(2.0, spvNMax(dot(_171, _171), (abs(dot(_171, _172 - _131)) * _166) * 60.0), -0.20000000298023223876953125)));
-    vec3 _186 = normalize(_171).xyz;
-    bool _188 = dot(_7._m0, _186) < 0.0;
+
+    // FIX: The CSM shader reconstructs position as _4 * _130 (jittered ray × unjittered depth),
+    // but never unjitters the ray direction. This makes dFdxFine/dFdyFine normals wobble
+    // each frame with TAA jitter → bias offset changes → shadow acne and flickering.
+    //
+    // Split normal usage: derivative normal for backface detection (needs surface orientation),
+    // light direction for bias offset (needs frame-to-frame stability).
+    vec3 _186_deriv = normalize(_171).xyz;
+    vec3 _186;
+    if (pc.rendering_shadow_improvements > 0.5)
+    {
+        // Blend derivative normal (surface-aware XY offset) with light direction (stable Z).
+        // The derivative normal wobbles with TAA jitter → flickering.
+        // The light direction is perfectly stable but lacks surface-angle awareness → acne.
+        // 70% light direction for stability, 30% surface normal for XY receiver-plane bias.
+        _186 = normalize(mix(_186_deriv, normalize(_7._m0), 0.7));
+    }
+    else
+    {
+        _186 = _186_deriv;
+    }
+    // CSM mode 3/4: diagnostic — force light direction as normal
+    if (csmMode == 3 || csmMode == 4) { _186 = normalize(_7._m0); }
+    bool _188 = dot(_7._m0, _186_deriv) < 0.0;
     bool _191 = _19._m0 != 0u;
     bool _235;
     float _236;
@@ -234,6 +289,7 @@ void main()
     float _251;
     vec2 _259;
     float _696;
+    int rdx_cascadeIdx = -1;
     do
     {
         _244 = vec4(_131, 1.0);
@@ -296,6 +352,7 @@ void main()
             _367 = _335;
             _368 = _336;
         }
+        rdx_cascadeIdx = _367;
         bool _369 = _368 > 0.0;
         float _370 = float(_369);
         if ((((!_369) && (subgroupQuadSwapHorizontal(_370) < 0.5)) && (subgroupQuadSwapVertical(_370) < 0.5)) && (subgroupQuadSwapDiagonal(_370) < 0.5))
@@ -386,6 +443,8 @@ void main()
             _511 = _492 / spvNMax(_491, 1.0);
             break;
         } while(false);
+        // CSM mode 2/4: skip blocker search — force _511 = surface depth (no PCSS)
+        if (csmMode == 2 || csmMode == 4) { _511 = _366.z; }
         float _579;
         float _580;
         bool _581;
@@ -528,6 +587,22 @@ void main()
     {
         _788 = _696;
     }
-    _5 = vec4(_788);
+    // CSM Diagnostic Modes (functional — modify shadow computation)
+    // 0 = off (vanilla)
+    // 1 = cascade bands
+    // 2 = skip blocker search — use fixed PCF radius (tests PCSS instability)
+    // 3 = stable normal (light dir instead of ddx/ddy — tests normal instability)
+    // 4 = both: skip blocker + stable normal
+    if (csmMode == 1)
+    {
+        float cv = (rdx_cascadeIdx == 0) ? 0.2 :
+                   (rdx_cascadeIdx == 1) ? 0.4 :
+                   (rdx_cascadeIdx == 2) ? 0.7 : 1.0;
+        _5 = vec4(cv);
+    }
+    else
+    {
+        _5 = vec4(_788);
+    }
 }
 

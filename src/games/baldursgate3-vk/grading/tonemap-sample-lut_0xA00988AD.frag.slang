@@ -97,12 +97,6 @@ void frag_main()
             lut_output *= 0.16f / 0.18f;
         }
 
-        //lut_output = GamutCompress(lut_output);
-        
-        if (RENODX_GAMMA_CORRECTION == 0.f) {
-            lut_output = GammaCorrectHuePreserving(lut_output, true);
-        }
-
         float3 pre_tonemap_bt709 = lut_output;
 
         lut_output = PsychoGrade(lut_output);
@@ -112,18 +106,13 @@ void frag_main()
             float3 tonemapped_bt709 = renodx::color::bt709::from::BT2020(lut_output);
             float peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
             float3 hue_ref = renodx::tonemap::neutwo::PerChannel(
-                max(0, pre_tonemap_bt709), peak.xxx);
-            tonemapped_bt709 = CorrectHueAndPurityMBGated(tonemapped_bt709, hue_ref, RENODX_HUE_CORRECTION, 0.5f, 1.f, 0.f);
+                max(0, _84), peak.xxx);
+            tonemapped_bt709 = CorrectHueAndPurityMBGated(tonemapped_bt709, hue_ref, RENODX_HUE_CORRECTION, 0.05f, 0.5f, 0.f);
             lut_output = renodx::color::bt2020::from::BT709(tonemapped_bt709);
         }
-        {
-            float peak = RENODX_PEAK_WHITE_NITS / RENODX_DIFFUSE_WHITE_NITS;
-            float knee = peak * 0.85f;
-            float max_c = max(lut_output.r, max(lut_output.g, lut_output.b));
-            if (max_c > knee) {
-                float compressed = knee + (peak - knee) * (1.f - exp(-(max_c - knee) / (peak - knee)));
-                lut_output *= compressed / max_c;
-            }
+        
+        if (RENODX_GAMMA_CORRECTION == 0.f) {
+          lut_output = GammaCorrectHuePreserving(lut_output, true);
         }
 
         if (RENODX_CUSTOM_GRAIN_STRENGTH > 0) {

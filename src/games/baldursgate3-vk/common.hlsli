@@ -353,6 +353,30 @@ float3 PsychoGrade(float3 ungraded_bt709) {
     tonemapped = renodx::color::bt709::clamp::AP1(tonemapped);
   }
 
+  if (cg_config.hue_emulation_strength != 0.f || cg_config.chrominance_emulation_strength != 0.f) {
+    float3 ungraded_clamped = max(0, ungraded_bt709);
+    float3 hue_reference = renodx::tonemap::neutwo::PerChannel(ungraded_clamped, peak_ratio.xxx);
+    float3 purity_reference = renodx::tonemap::neutwo::MaxChannel(ungraded_clamped, peak_ratio);
+    if (cg_config.hue_emulation_strength != 0.f) {
+      tonemapped = CorrectHueAndPurityMBGated(
+          tonemapped,
+          hue_reference,
+          cg_config.hue_emulation_strength,
+          0.5f,
+          1.f,
+          0.f);
+    }
+    if (cg_config.chrominance_emulation_strength != 0.f) {
+      tonemapped = CorrectHueAndPurityMBGated(
+          tonemapped,
+          purity_reference,
+          0.f,
+          0.5f,
+          1.f,
+          cg_config.chrominance_emulation_strength);
+    }
+  }
+
   return tonemapped;
 }
 

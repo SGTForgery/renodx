@@ -10,10 +10,9 @@
 
 #include <deps/imgui/imgui.h>
 #include <include/reshade.hpp>
-
 #include <embed/shaders.h>
-
 #include "../../mods/shader.hpp"
+#include "../../utils/constants.hpp"
 #include "../../utils/date.hpp"
 #include "../../utils/resource_upgrade.hpp"
 #include "../../utils/settings.hpp"
@@ -21,6 +20,7 @@
 #include "./shared.h"
 
 namespace {
+
 
 renodx::mods::shader::CustomShaders custom_shaders = {__ALL_CUSTOM_SHADERS};
 
@@ -70,7 +70,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "ColorGradeHueShift",
         .binding = &shader_injection.tone_map_hue_shift,
-        .default_value = 25.f,
+        .default_value = 0.f,
         .label = "Hue Shift",
         .section = "Tone Mapping",
         .tooltip = "Hue-shift emulation strength",
@@ -81,10 +81,21 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "ColorGradeBlowout",
         .binding = &shader_injection.tone_map_blowout,
-        .default_value = 50.f,
+        .default_value = 0.f,
         .label = "Purity Blowout",
         .section = "Tone Mapping",
         .tooltip = "Chrominance blowout emulation strength",
+        .max = 100.f,
+        .parse = [](float value) { return value * 0.02f; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "HueCorrection",
+        .binding = &shader_injection.hue_correction,
+        .default_value = 30.f,
+        .label = "Hue Correction",
+        .section = "Tone Mapping",
+        .tooltip = "Hue and purity correction strength via MacLeod-Boynton",
         .max = 100.f,
         .parse = [](float value) { return value * 0.02f; },
         .is_visible = []() { return false; },
@@ -186,17 +197,6 @@ renodx::utils::settings::Settings settings = {
         .parse = [](float value) { return value * 0.02f; },
         .is_visible = []() { return false; },
     },
-    new renodx::utils::settings::Setting{
-        .key = "HueCorrection",
-        .binding = &shader_injection.hue_correction,
-        .default_value = 100.f,
-        .label = "Hue Correction",
-        .section = "Color Grading",
-        .tooltip = "Hue and purity correction strength via MacLeod-Boynton",
-        .max = 100.f,
-        .parse = [](float value) { return value * 0.02f; },
-        .is_visible = []() { return false; },
-    },
     new renodx::utils::settings::Setting({
             .key = "FxBloom",
             .binding = &shader_injection.custom_bloom,
@@ -272,7 +272,17 @@ renodx::utils::settings::Settings settings = {
             .label = "Micro Shadows Debug View",
             .section = "Rendering",
             .labels = {"Off", "On"},
-            .is_visible = []() { return false; },
+            //.is_visible = []() { return false; },
+        }),
+    new renodx::utils::settings::Setting({
+            .key = "CSMDebug",
+            .binding = &shader_injection.csm_debug,
+            .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+            .default_value = 0.f,
+            .label = "CSM Debug View",
+            .section = "Rendering",
+            .tooltip = "0=Off, 1=Cascade, 2=SkipPCSS, 3=StableNrm, 4=Both, 5=JitterViz",
+            .max = 5.f,
         }),
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
@@ -386,6 +396,7 @@ void OnPresetOff() {
       {"RenderingShadowImprovements", 0.f},
       {"RenderingMicroShadows", 0.f},
       {"RenderingMicroShadowsDebug", 0.f},
+      {"CSMDebug", 0.f},
   });
 }
 
@@ -432,7 +443,7 @@ void OnInitDevice(reshade::api::device* device) {
           .dimensions = backbuffer_dim,
           .usage_include = reshade::api::resource_usage::render_target,
       },
-      // UI character portrait RT — 1400x1380 (~1:1, excluded by aspect filter above)
+      // UI character portrait RT — 1400x1380 
       {
           .old_format = reshade::api::format::r8g8b8a8_typeless,
           .new_format = target_format,
@@ -549,6 +560,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       break;
   }
 
+  renodx::utils::constants::Use(fdw_reason);
   renodx::utils::settings::Use(fdw_reason, &settings, &OnPresetOff);
   renodx::mods::shader::Use(fdw_reason, custom_shaders, &shader_injection);
   renodx::utils::random::binds.push_back(&shader_injection.custom_random);

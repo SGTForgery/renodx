@@ -32,6 +32,7 @@ struct ShaderInjectData {
   float rendering_shadow_improvements;
   float rendering_micro_shadows;
   float rendering_micro_shadows_debug;
+  float csm_debug;
 };
 
 #ifndef __cplusplus
