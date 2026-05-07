@@ -154,6 +154,9 @@ layout(set = 1, binding = 4) uniform texture2DArray _17;
 layout(set = 1, binding = 5) uniform texture2D _18;
 layout(set = 1, binding = 6) uniform texture2D _20;
 
+// GBuffer normal (octahedral R16G16_SFLOAT) — injected by addon via push_descriptors
+layout(set = 3, binding = 0) uniform texture2D gbufferNormal;
+
 layout(location = 0) in vec3 _4;
 layout(location = 0) out vec4 _5;
 
@@ -226,11 +229,26 @@ void main()
     vec3 _186;
     if (pc.rendering_shadow_improvements > 0.5)
     {
-        // Blend derivative normal (surface-aware XY offset) with light direction (stable Z).
-        // The derivative normal wobbles with TAA jitter → flickering.
-        // The light direction is perfectly stable but lacks surface-angle awareness → acne.
-        // 70% light direction for stability, 30% surface normal for XY receiver-plane bias.
-        _186 = normalize(mix(_186_deriv, normalize(_7._m0), 0.7));
+        // Decode octahedral GBuffer normal (R16G16_FLOAT, stored in VIEW SPACE)
+        vec2 gbNormalXY = texelFetch(gbufferNormal, _127, 0).xy;
+        vec3 oct = fma(vec3(gbNormalXY, 0.0),
+                       vec3(3.55539989471435546875, 3.55539989471435546875, 0.0),
+                       vec3(-1.777699947357177734375, -1.777699947357177734375, 1.0));
+        float octLen2 = dot(oct, oct);
+        // Decode: if valid octahedral data, reconstruct 3D normal; otherwise fall back
+        if (octLen2 < 54000001024.0 && octLen2 > 0.0)
+        {
+            float octInv = 2.0 / octLen2;
+            vec3 viewNormal = normalize(vec3(oct.xy * octInv, 1.0 - octInv));
+            // Transform from view space to world space using inverse view matrix (_7._m6)
+            _186 = normalize(viewNormal * mat3(_7._m6[0].xyz, _7._m6[1].xyz, _7._m6[2].xyz));
+        }
+        else
+        {
+            // Fallback: adaptive blend of derivative normal + light direction
+            float lightBlend = mix(0.4, 0.9, _183);
+            _186 = normalize(mix(_186_deriv, normalize(_7._m0), lightBlend));
+        }
     }
     else
     {
@@ -593,12 +611,37 @@ void main()
     // 2 = skip blocker search — use fixed PCF radius (tests PCSS instability)
     // 3 = stable normal (light dir instead of ddx/ddy — tests normal instability)
     // 4 = both: skip blocker + stable normal
+    // 5 = NdotL from GBuffer normal (0.5=perp, 1.0=lit, 0.0=backface)
+    // 6 = NdotL from derivative normal
+    // 7 = GBuffer bind test (bright=has data, black=zero)
     if (csmMode == 1)
     {
         float cv = (rdx_cascadeIdx == 0) ? 0.2 :
                    (rdx_cascadeIdx == 1) ? 0.4 :
                    (rdx_cascadeIdx == 2) ? 0.7 : 1.0;
         _5 = vec4(cv);
+    }
+    else if (csmMode == 5)
+    {
+        // DIAGNOSTIC: textureSize of gbufferNormal
+        // If bound to our 2560x1440 SRV: width/4096 = 0.625 (medium bright)
+        // If bound to something else: different brightness
+        // If unbound/garbage: undefined (likely 0 or random)
+        ivec2 sz = textureSize(gbufferNormal, 0);
+        _5 = vec4(float(sz.x) / 4096.0);
+    }
+    else if (csmMode == 6)
+    {
+        // NdotL from derivative normal (reference — known working)
+        float ndotl = dot(normalize(_7._m0), _186_deriv);
+        _5 = vec4(ndotl * 0.5 + 0.5);
+    }
+    else if (csmMode == 7)
+    {
+        // DIAGNOSTIC: textureSize height
+        // If bound to 2560x1440: height/4096 = 0.3515 (dim)
+        ivec2 sz = textureSize(gbufferNormal, 0);
+        _5 = vec4(float(sz.y) / 4096.0);
     }
     else
     {

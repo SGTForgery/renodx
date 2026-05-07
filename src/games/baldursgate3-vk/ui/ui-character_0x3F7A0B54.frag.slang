@@ -1,5 +1,7 @@
 
 
+#include "../shared.h"
+
 [[vk::binding(0, 1)]]
 cbuffer _8_7 : register(b0, space1)
 {
@@ -32,7 +34,11 @@ void frag_main()
     float3 _38 = _5.SampleLevel(_6, _3, 0.0f).xyz;
     bool3 _39 = bool3(_38.x == 0.0f.xxx.x, _38.y == 0.0f.xxx.y, _38.z == 0.0f.xxx.z);
     float3 _44 = pow(max(_38, 0.0f.xxx), _7_m1.xxx); // The original code had a clamp here
-    _4 = float4(float3(_39.x ? 0.0f.xxx.x : _44.x, _39.y ? 0.0f.xxx.y : _44.y, _39.z ? 0.0f.xxx.z : _44.z), 1.0f);
+    float3 color = float3(_39.x ? 0.0f.xxx.x : _44.x, _39.y ? 0.0f.xxx.y : _44.y, _39.z ? 0.0f.xxx.z : _44.z);
+    if (shader_injection.rendering_shadow_improvements != 0.f) {
+        color *= 1.4f;
+    }
+    _4 = float4(color, 1.0f);
 }
 
 SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)

@@ -313,6 +313,12 @@ layout(push_constant) uniform RenoDXPushConstants {
     float rendering_shadow_improvements; // 92
     float rendering_micro_shadows;       // 96
     float rendering_micro_shadows_debug; // 100
+    float csm_debug;                     // 104
+    float rendering_specular_occlusion;  // 108
+    float rendering_probe_ao;            // 112
+    float rendering_horizon_occlusion;   // 116
+    float rendering_diffuse_brdf;       // 120
+    float hero_lighting;                 // 124
 } pc;
 
 spirv_instruction(set = "GLSL.std.450", id = 79) float spvNMin(float, float);
@@ -325,10 +331,11 @@ spirv_instruction(set = "GLSL.std.450", id = 80) vec3 spvNMax(vec3, vec3);
 spirv_instruction(set = "GLSL.std.450", id = 80) vec4 spvNMax(vec4, vec4);
 
 // --- RenoDX: Cubemap / IBL Modulation ---
-float rdx_cubemap_modulation(vec3 skyLight, float roughness) {
+float rdx_cubemap_modulation(vec3 skyLight, float roughness, float aoFactor) {
     float skyLum = max(0.0, dot(skyLight, vec3(0.2126, 0.7152, 0.0722)));
     float mod_factor = smoothstep(0.0, 0.25, skyLum)
-                     * mix(0.5, 1.0, clamp(roughness, 0.0, 1.0));
+                     * mix(0.5, 1.0, clamp(roughness, 0.0, 1.0))
+                     * mix(0.4, 1.0, clamp(aoFactor, 0.0, 1.0));
     return mix(0.3, 1.0, mod_factor);
 }
 
@@ -356,6 +363,44 @@ float rdx_micro_shadow_march(
         }
     }
     return 1.0 - occlusion * 0.5;
+}
+
+// --- RenoDX: Hammon 2017 Diffuse BRDF (multi-scatter compensated) ---
+vec3 rdx_hammon_diffuse(float NdotL, float NdotV, float NdotH, float VdotH, float roughness, vec3 albedo) {
+    float facing = 0.5 + 0.5 * VdotH;
+    float rough  = facing * (0.9 - 0.4 * facing) * (0.5 / max(NdotH, 0.1) + 1.0);
+    float smooth_val = 1.05 * (1.0 - pow(1.0 - NdotL, 5.0)) * (1.0 - pow(1.0 - NdotV, 5.0));
+    float single = mix(smooth_val, rough, roughness) * (1.0 / 3.14159265);
+    float multi  = 0.1159 * roughness;
+    return albedo * (vec3(single) + albedo * multi);
+}
+
+// --- RenoDX: EON 2025 Diffuse BRDF (energy-preserving rough diffuse) ---
+const float RDX_EON_C1 = 0.5 - 2.0 / (3.0 * 3.14159265);
+const float RDX_EON_C2 = 2.0 / 3.0 - 28.0 / (15.0 * 3.14159265);
+
+float rdx_eon_E_approx(float mu, float r) {
+    float mc = 1.0 - mu;
+    float G = mc * (0.0571085289 + mc * (0.491881867
+            + mc * (-0.332181442 + mc * 0.0714429953)));
+    return (1.0 + r * G) / (1.0 + RDX_EON_C1 * r);
+}
+
+vec3 rdx_eon_diffuse(float NdotL, float NdotV, float VdotL, float roughness, vec3 albedo) {
+    float s = VdotL - NdotL * NdotV;
+    float st = (s > 0.0) ? (s / max(NdotL, NdotV)) : s;
+    float AF = 1.0 / (1.0 + RDX_EON_C1 * roughness);
+    vec3 f_ss = albedo * (0.3183098733425140380859375 * AF * (1.0 + roughness * st));
+    float EFo = rdx_eon_E_approx(NdotV, roughness);
+    float EFi = rdx_eon_E_approx(NdotL, roughness);
+    float avgEF = AF * (1.0 + RDX_EON_C2 * roughness);
+    vec3 rho_ms = (albedo * albedo) * avgEF
+                / max(vec3(1e-7), vec3(1.0) - albedo * (1.0 - avgEF));
+    vec3 f_ms = rho_ms * (0.3183098733425140380859375
+              * max(1e-7, 1.0 - EFo)
+              * max(1e-7, 1.0 - EFi)
+              / max(1e-7, 1.0 - avgEF));
+    return f_ss + f_ms;
 }
 
 void main()
@@ -631,7 +676,15 @@ void main()
                             float _2616 = _2596 * _2596;
                             float _2619 = fma(fma(_2403, _2616, -_2403), _2403, 1.0);
                             _2626 = fma(_2567, (_598 + ((vec3(1.0) - _598) * pow(spvNMax(abs(1.0 - _2401), 9.9999997473787516355514526367188e-05), 5.0))) * ((0.5 / fma(_2405, sqrt(fma(fma(-_2334, _2604, _2334), _2334, _2604)), _2334 * sqrt(fma(fma(-_2405, _2604, _2405), _2405, _2604)))) * (_2616 * (0.3183098733425140380859375 / (_2619 * _2619)))), _2341);
-                            _2627 = fma(_2567, _593 * (0.3183098733425140380859375 * (((vec3(1.0) + (_2574 * pow(spvNMax(abs(1.0 - _2405), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_2574 * pow(spvNMax(abs(1.0 - _2334), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _635))), _2343);
+                            vec3 _rdx_diffuse1;
+                            if (pc.rendering_diffuse_brdf > 1.5) {
+                                _rdx_diffuse1 = rdx_eon_diffuse(_2405, _2334, 2.0 * _2401 * _2401 - 1.0, _635, _593);
+                            } else if (pc.rendering_diffuse_brdf > 0.5) {
+                                _rdx_diffuse1 = rdx_hammon_diffuse(_2405, _2334, _2403, _2401, _635, _593);
+                            } else {
+                                _rdx_diffuse1 = _593 * (0.3183098733425140380859375 * (((vec3(1.0) + (_2574 * pow(spvNMax(abs(1.0 - _2405), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_2574 * pow(spvNMax(abs(1.0 - _2334), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _635)));
+                            }
+                            _2627 = fma(_2567, _rdx_diffuse1, _2343);
                         }
                         else
                         {
@@ -795,7 +848,15 @@ void main()
                             float _2901 = _2881 * _2881;
                             float _2904 = fma(fma(_2698, _2901, -_2698), _2698, 1.0);
                             _2911 = fma(_2852, (_598 + ((vec3(1.0) - _598) * pow(spvNMax(abs(1.0 - _2696), 9.9999997473787516355514526367188e-05), 5.0))) * ((0.5 / fma(_2700, sqrt(fma(fma(-_2334, _2889, _2334), _2334, _2889)), _2334 * sqrt(fma(fma(-_2700, _2889, _2700), _2700, _2889)))) * (_2901 * (0.3183098733425140380859375 / (_2904 * _2904)))), _2638);
-                            _2912 = fma(_2852, _593 * (0.3183098733425140380859375 * (((vec3(1.0) + (_2859 * pow(spvNMax(abs(1.0 - _2700), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_2859 * pow(spvNMax(abs(1.0 - _2334), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _635))), _2640);
+                            vec3 _rdx_diffuse2;
+                            if (pc.rendering_diffuse_brdf > 1.5) {
+                                _rdx_diffuse2 = rdx_eon_diffuse(_2700, _2334, 2.0 * _2696 * _2696 - 1.0, _635, _593);
+                            } else if (pc.rendering_diffuse_brdf > 0.5) {
+                                _rdx_diffuse2 = rdx_hammon_diffuse(_2700, _2334, _2698, _2696, _635, _593);
+                            } else {
+                                _rdx_diffuse2 = _593 * (0.3183098733425140380859375 * (((vec3(1.0) + (_2859 * pow(spvNMax(abs(1.0 - _2700), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_2859 * pow(spvNMax(abs(1.0 - _2334), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _635)));
+                            }
+                            _2912 = fma(_2852, _rdx_diffuse2, _2640);
                         }
                         else
                         {
@@ -976,7 +1037,7 @@ void main()
                         {
                             _3184 = _2918;
                             _3185 = _2921;
-                            _3186 = _3079;
+                            _3186 = ((_540 == 5u || _540 == 7u) && pc.hero_lighting > 0.5) ? 0.0 : _3079;
                         }
                         vec3 _3227;
                         if (_2963 >= 0)
@@ -1011,7 +1072,15 @@ void main()
                                 float _3348 = _3328 * _3328;
                                 float _3351 = fma(fma(_2989, _3348, -_2989), _2989, 1.0);
                                 _3358 = fma(_3299, (_598 + ((vec3(1.0) - _598) * pow(spvNMax(abs(1.0 - _2987), 9.9999997473787516355514526367188e-05), 5.0))) * ((0.5 / fma(_2991, sqrt(fma(fma(-_2334, _3336, _2334), _2334, _3336)), _2334 * sqrt(fma(fma(-_2991, _3336, _2991), _2991, _3336)))) * (_3348 * (0.3183098733425140380859375 / (_3351 * _3351)))), _2923);
-                                _3359 = fma(_3299, _593 * (0.3183098733425140380859375 * (((vec3(1.0) + (_3306 * pow(spvNMax(abs(1.0 - _2991), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_3306 * pow(spvNMax(abs(1.0 - _2334), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _635))), _2925);
+                                vec3 _rdx_diffuse3;
+                                if (pc.rendering_diffuse_brdf > 1.5) {
+                                    _rdx_diffuse3 = rdx_eon_diffuse(_2991, _2334, 2.0 * _2987 * _2987 - 1.0, _635, _593);
+                                } else if (pc.rendering_diffuse_brdf > 0.5) {
+                                    _rdx_diffuse3 = rdx_hammon_diffuse(_2991, _2334, _2989, _2987, _635, _593);
+                                } else {
+                                    _rdx_diffuse3 = _593 * (0.3183098733425140380859375 * (((vec3(1.0) + (_3306 * pow(spvNMax(abs(1.0 - _2991), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_3306 * pow(spvNMax(abs(1.0 - _2334), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _635)));
+                                }
+                                _3359 = fma(_3299, _rdx_diffuse3, _2925);
                             }
                             else
                             {
@@ -1035,7 +1104,15 @@ void main()
                                 float _3283 = _3263 * _3263;
                                 float _3286 = fma(fma(_2989, _3283, -_2989), _2989, 1.0);
                                 _3293 = fma(_3234, (_598 + ((vec3(1.0) - _598) * pow(spvNMax(abs(1.0 - _2987), 9.9999997473787516355514526367188e-05), 5.0))) * ((0.5 / fma(_2991, sqrt(fma(fma(-_2334, _3271, _2334), _2334, _3271)), _2334 * sqrt(fma(fma(-_2991, _3271, _2991), _2991, _3271)))) * (_3283 * (0.3183098733425140380859375 / (_3286 * _3286)))), _2923);
-                                _3294 = fma(_3234, _593 * (0.3183098733425140380859375 * (((vec3(1.0) + (_3241 * pow(spvNMax(abs(1.0 - _2991), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_3241 * pow(spvNMax(abs(1.0 - _2334), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _635))), _2925);
+                                vec3 _rdx_diffuse4;
+                                if (pc.rendering_diffuse_brdf > 1.5) {
+                                    _rdx_diffuse4 = rdx_eon_diffuse(_2991, _2334, 2.0 * _2987 * _2987 - 1.0, _635, _593);
+                                } else if (pc.rendering_diffuse_brdf > 0.5) {
+                                    _rdx_diffuse4 = rdx_hammon_diffuse(_2991, _2334, _2989, _2987, _635, _593);
+                                } else {
+                                    _rdx_diffuse4 = _593 * (0.3183098733425140380859375 * (((vec3(1.0) + (_3241 * pow(spvNMax(abs(1.0 - _2991), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_3241 * pow(spvNMax(abs(1.0 - _2334), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _635)));
+                                }
+                                _3294 = fma(_3234, _rdx_diffuse4, _2925);
                             }
                             else
                             {
@@ -1574,7 +1651,7 @@ void main()
                             {
                                 _1962 = _1725;
                                 _1963 = _1727;
-                                _1964 = clamp(fma(2.0, _1870, 0.5), 0.0, 1.0);
+                                _1964 = ((_540 == 5u || _540 == 7u) && pc.hero_lighting > 0.5) ? 0.0 : clamp(fma(2.0, _1870, 0.5), 0.0, 1.0);
                             }
                             float _1965 = ((_1864.x * _1864.y) * _1864.z) * _1964;
                             vec3 _2006;
@@ -1757,6 +1834,17 @@ void main()
         vec3 _3515;
         _3512 = _3491;
         _3515 = _3492;
+        // --- RenoDX: Early AO read for probe/IBL modulation ---
+        float _rdx_early_ao = 1.0;
+        if (_34._m0.x > 0.0) {
+            _rdx_early_ao = textureLod(sampler2D(_40, _12), _469, 0.0).x;
+        }
+        // --- RenoDX: IBL Modulation ---
+        if (pc.rendering_cubemap_mod > 0.5) {
+            float _rdx_cubeMod = rdx_cubemap_modulation(_3418, _635, _rdx_early_ao);
+            _3512 *= _rdx_cubeMod;
+            _3515 *= _rdx_cubeMod;
+        }
         vec3 _3513;
         vec3 _3516;
         for (uint _3517 = _3508; _3517 < _3510; _3512 = _3513, _3515 = _3516, _3517++)
@@ -2092,13 +2180,21 @@ void main()
                     {
                         _3911 = vec4(0.0);
                     }
+                    // --- RenoDX: Per-Probe AO Modulation (diffuse) ---
+                    if (pc.rendering_cubemap_mod > 0.5) {
+                        _3911.xyz *= mix(0.4, 1.0, _rdx_early_ao);
+                    }
                     _3915 = (_3747 * 0.300000011920928955078125) + (_3911 * 0.699999988079071044921875);
                 }
                 else
                 {
                     _3915 = _3747;
                 }
-                _3920 = mix(_3515, _3915.xyz, vec3(_3915.w));
+                float _rdx_probeBlendD = _3915.w;
+                if ((_540 == 5u || _540 == 7u) && pc.hero_lighting > 0.5) {
+                    _rdx_probeBlendD *= 0.3;
+                }
+                _3920 = mix(_3515, _3915.xyz, vec3(_rdx_probeBlendD));
             }
             else
             {
@@ -2415,13 +2511,21 @@ void main()
                     {
                         _4268 = vec4(0.0);
                     }
+                    // --- RenoDX: Per-Probe AO Modulation (specular) ---
+                    if (pc.rendering_cubemap_mod > 0.5) {
+                        _4268.xyz *= mix(0.4, 1.0, _rdx_early_ao);
+                    }
                     _4272 = (_4094 * 0.300000011920928955078125) + (_4268 * 0.699999988079071044921875);
                 }
                 else
                 {
                     _4272 = _4094;
                 }
-                _4277 = mix(_3512, _4272.xyz, vec3(_4272.w));
+                float _rdx_probeBlendS = _4272.w;
+                if ((_540 == 5u || _540 == 7u) && pc.hero_lighting > 0.5) {
+                    _rdx_probeBlendS *= 0.3;
+                }
+                _4277 = mix(_3512, _4272.xyz, vec3(_rdx_probeBlendS));
             }
             else
             {
@@ -2431,12 +2535,6 @@ void main()
             _3516 = _3920;
         }
         float _4278 = _6._m0[0u] * 100.0;
-        // --- RenoDX: IBL Modulation ---
-        if (pc.rendering_cubemap_mod > 0.0) {
-            float rdx_mod = rdx_cubemap_modulation(_3418, _635);
-            _3512 *= rdx_mod;
-            _3515 *= rdx_mod;
-        }
         bool _4283 = _26._m19 > 0.0;
         vec3 _4344;
         SPIRV_CROSS_BRANCH
@@ -2527,7 +2625,17 @@ void main()
             float _4772 = _4752 * _4752;
             float _4775 = fma(fma(_4747, _4772, -_4747), _4747, 1.0);
             _4787 = _3366 + ((_4534 * ((_598 + ((vec3(1.0) - _598) * pow(spvNMax(abs(1.0 - clamp(dot(_4741, _4743), 0.0, 1.0)), 9.9999997473787516355514526367188e-05), 5.0))) * ((0.5 / fma(_4749, sqrt(fma(fma(-_4699, _4760, _4699), _4699, _4760)), _4699 * sqrt(fma(fma(-_4749, _4760, _4749), _4749, _4760)))) * (_4772 * (0.3183098733425140380859375 / (_4775 * _4775)))))) * _4705);
-            _4788 = _3367 + ((_4534 * (_593 * (0.3183098733425140380859375 * (((vec3(1.0) + (_4712 * pow(spvNMax(abs(1.0 - _4705), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_4712 * pow(spvNMax(abs(1.0 - _4699), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _635))))) * _4705);
+            // --- RenoDX: Hammon Diffuse (Sun directional light) ---
+            float _rdx_sun_NdotH = clamp(dot(_590, normalize(_602 + _26._m0)), 0.0, 1.0);
+            vec3 _rdx_sun_diffuse;
+            if (pc.rendering_diffuse_brdf > 1.5) {
+                _rdx_sun_diffuse = rdx_eon_diffuse(_4705, _4699, 2.0 * _4703 * _4703 - 1.0, _635, _593);
+            } else if (pc.rendering_diffuse_brdf > 0.5) {
+                _rdx_sun_diffuse = rdx_hammon_diffuse(_4705, _4699, _rdx_sun_NdotH, _4703, _635, _593);
+            } else {
+                _rdx_sun_diffuse = _593 * (0.3183098733425140380859375 * (((vec3(1.0) + (_4712 * pow(spvNMax(abs(1.0 - _4705), 9.9999997473787516355514526367188e-05), 5.0))).x * (vec3(1.0) + (_4712 * pow(spvNMax(abs(1.0 - _4699), 9.9999997473787516355514526367188e-05), 5.0))).x) * mix(1.0, 0.662251651287078857421875, _635)));
+            }
+            _4788 = _3367 + ((_4534 * _rdx_sun_diffuse) * _4705);
         }
         else
         {
@@ -2579,10 +2687,32 @@ void main()
             _4809 = 1.0;
         }
         // --- RenoDX: AO on Direct Lights ---
-        if (pc.rendering_ao_direct > 0.0) {
+        if (pc.rendering_ao_direct > 0.5) {
             float rdx_ao_factor = mix(1.0, _4809, 0.7);
             _4787 *= rdx_ao_factor;
             _4788 -= _3367 * (1.0 - rdx_ao_factor);
+        }
+        // --- RenoDX: Specular Occlusion from AO (Lagarde) ---
+        if (pc.rendering_specular_occlusion > 0.5) {
+            float _rdx_specOcc = clamp(
+                pow(spvNMax(abs(_3419 + _4809), 1e-7),
+                    exp2(-16.0 * _635 - 1.0)) - 1.0 + _4809,
+                0.0, 1.0);
+            float _rdx_specOccBlend = mix(_rdx_specOcc, 1.0, (1.0 - _635) * 0.5);
+            _3512 *= _rdx_specOccBlend;
+        }
+        // --- RenoDX: AO-Weighted Probe Light Leak Fix ---
+        if (pc.rendering_probe_ao > 0.5) {
+            float _rdx_probe_weight = mix(1.0, _4809, 0.6);
+            _3512 *= _rdx_probe_weight;
+            _3515 *= _rdx_probe_weight;
+        }
+        // --- RenoDX: Horizon Occlusion on Indirect Light ---
+        if (pc.rendering_horizon_occlusion > 0.5) {
+            float _rdx_NdotR = dot(_590, _3369);
+            float _rdx_horizon = clamp(1.0 + _rdx_NdotR, 0.0, 1.0);
+            _rdx_horizon *= _rdx_horizon;
+            _3512 *= _rdx_horizon;
         }
         vec3 _4817 = (_4788 * mix(1.0, _4809, _34._m0.y)) + ((_3515 * _4278) * _4809);
         vec3 _4819 = (_4787 * mix(1.0, _4808, _34._m0.y)) + ((_3512 * _4278) * _4808);
@@ -2781,7 +2911,7 @@ void main()
             _5325 = _4817;
         }
         // --- RenoDX: Micro Shadow Debug View ---
-        if (pc.rendering_micro_shadows_debug > 0.5) {
+        if (pc.rendering_micro_shadows_debug > 0.5 && pc.rendering_micro_shadows_debug < 1.5) {
             vec3 _rdx_lv = mat3(_26._m6[0].xyz, _26._m6[1].xyz, _26._m6[2].xyz) * _26._m0;
             vec2 _rdx_raw = vec2(_rdx_lv.x, -_rdx_lv.y);
             float _rdx_len = length(_rdx_raw);

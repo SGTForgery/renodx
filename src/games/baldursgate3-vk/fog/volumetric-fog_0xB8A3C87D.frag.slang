@@ -1,5 +1,7 @@
 
 
+#include "../shared.h"
+
 [[vk::binding(30, 1)]]
 cbuffer _16_12 : register(b30, space1)
 {
@@ -145,7 +147,40 @@ void frag_main()
         float _209 = _208.x;
         float4 _224 = _166.y.xxxx;
         float _229 = _177.z;
-        float4 _255 = lerp(lerp(lerp(_10.SampleLevel(_11, float3(max(_12_m15, min(_12_m16, _177.xy)), _229), 0.0f), _10.SampleLevel(_11, float3(_209, _208.y, _229), 0.0f), _202), lerp(_10.SampleLevel(_11, float3(_196, _195.y, _229), 0.0f), _10.SampleLevel(_11, float3(max(_12_m15, min(_12_m16, float2(_204, _173.y))), _229), 0.0f), _202), _224), lerp(lerp(_10.SampleLevel(_11, float3(max(_12_m15, min(_12_m16, float2(_191, _177.y))), _185), 0.0f), _10.SampleLevel(_11, float3(_209, _208.y, _185), 0.0f), _202), lerp(_10.SampleLevel(_11, float3(_196, _195.y, _185), 0.0f), _10.SampleLevel(_11, float3(max(_12_m15, min(_12_m16, _173.xy)), _185), 0.0f), _202), _224), _166.z.xxxx) * float4(0.03125f, 0.03125f, 0.03125f, 3.0517578125e-05f);
+        // Extract the 8 tricubic tap samples explicitly
+        float4 _s111 = _10.SampleLevel(_11, float3(max(_12_m15, min(_12_m16, _177.xy)), _229), 0.0f);
+        float4 _s011 = _10.SampleLevel(_11, float3(_209, _208.y, _229), 0.0f);
+        float4 _s101 = _10.SampleLevel(_11, float3(_196, _195.y, _229), 0.0f);
+        float4 _s001 = _10.SampleLevel(_11, float3(max(_12_m15, min(_12_m16, float2(_204, _173.y))), _229), 0.0f);
+        float4 _s110 = _10.SampleLevel(_11, float3(max(_12_m15, min(_12_m16, float2(_191, _177.y))), _185), 0.0f);
+        float4 _s010 = _10.SampleLevel(_11, float3(_209, _208.y, _185), 0.0f);
+        float4 _s100 = _10.SampleLevel(_11, float3(_196, _195.y, _185), 0.0f);
+        float4 _s000 = _10.SampleLevel(_11, float3(max(_12_m15, min(_12_m16, _173.xy)), _185), 0.0f);
+        float4 _255;
+        if (shader_injection.rendering_fog_haze_aa > 0.0f) {
+            // §1.8e GoT Haze AA: filter L/α and α separately, then recompose
+            float3 _r111 = _s111.rgb / max(_s111.a, 1e-5f);
+            float3 _r011 = _s011.rgb / max(_s011.a, 1e-5f);
+            float3 _r101 = _s101.rgb / max(_s101.a, 1e-5f);
+            float3 _r001 = _s001.rgb / max(_s001.a, 1e-5f);
+            float3 _r110 = _s110.rgb / max(_s110.a, 1e-5f);
+            float3 _r010 = _s010.rgb / max(_s010.a, 1e-5f);
+            float3 _r100 = _s100.rgb / max(_s100.a, 1e-5f);
+            float3 _r000 = _s000.rgb / max(_s000.a, 1e-5f);
+            float3 _filtRatio = lerp(
+                lerp(lerp(_r111, _r011, _166.x), lerp(_r101, _r001, _166.x), _166.y),
+                lerp(lerp(_r110, _r010, _166.x), lerp(_r100, _r000, _166.x), _166.y),
+                _166.z);
+            float _filtAlpha = lerp(
+                lerp(lerp(_s111.a, _s011.a, _166.x), lerp(_s101.a, _s001.a, _166.x), _166.y),
+                lerp(lerp(_s110.a, _s010.a, _166.x), lerp(_s100.a, _s000.a, _166.x), _166.y),
+                _166.z);
+            _255 = float4(_filtRatio * _filtAlpha, _filtAlpha) * float4(0.03125f, 0.03125f, 0.03125f, 3.0517578125e-05f);
+        } else {
+            _255 = lerp(lerp(lerp(_s111, _s011, _202), lerp(_s101, _s001, _202), _224),
+                        lerp(lerp(_s110, _s010, _202), lerp(_s100, _s000, _202), _224),
+                        _166.z.xxxx) * float4(0.03125f, 0.03125f, 0.03125f, 3.0517578125e-05f);
+        }
         float _256 = _255.x;
         float4 _263;
         if (isinf(_256) || isnan(_256))
@@ -196,7 +231,9 @@ void frag_main()
         _291 = _290;
         break;
     } while(false);
-    float3 _296 = (_104.xyz * _291.w) + _291.xyz;
+    // Inscatter strength: 0 = no colour cast, 1 = full game inscatter. Transmittance unchanged.
+    float inscatterStrength = shader_injection.rendering_fog_color_correction;
+    float3 _296 = (_104.xyz * _291.w) + _291.xyz * inscatterStrength;
     _5 = float4(_296.x, _296.y, _296.z, _104.w);
 }
 

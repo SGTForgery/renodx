@@ -68,6 +68,7 @@
 // ║  2.  VNDF PDF evaluation   (probability density for MC weighting)            ║
 // ║  3.  Subsurface scattering (Hanrahan single-scatter transmission)            ║
 // ║  4.  RDX BRDF RT           (unified RT BRDF — single entry point)            ║
+// ║  5.  EON diffuse BRDF      (energy-preserving Oren–Nayar + CLTC sampling)   ║
 // ╚══════════════════════════════════════════════════════════════════════════════╝
 //
 // Rasterisation BRDF sections 6-8 and all of Part IV ported from
@@ -10314,12 +10315,13 @@ float3 HammonDiffuseBRDF(
   float facing = 0.5 + 0.5 * VdotH;
 
   // ---- Rough surface approximation ----------------------------------------
-  // Guard NdotH via safe division to avoid singularity when the half-vector
-  // lies in the tangent plane.  Uses the same safe-divide pattern as NVIDIA
-  // RTX Remix (materialEpsilon ≈ 8e-5) instead of the coarse max(NdotH, 0.1)
-  // clamp, giving more accurate retro-reflection at grazing angles.
+  // The term (0.5 + NdotH) / NdotH can blow up at grazing angles where
+  // NdotH approaches zero.  DivideSafe only catches exact zero, so tiny
+  // values like NdotH ≈ 0.0001 still produce ratios of ~5001.
+  // Hammon's original GDC 2017 presentation uses max(NdotH, 0.1) which
+  // caps the ratio at (0.6 / 0.1) = 6.0, preventing bright glow artifacts.
   float rough = facing * (0.9 - 0.4 * facing)
-              * ::renodx::math::DivideSafe(0.5 + NdotH, NdotH, 1.0);
+              * ((0.5 + NdotH) / max(NdotH, 0.1));
 
   // ---- Smooth surface approximation (Fresnel-weighted) --------------------
   // pow5(1 - x) expanded manually for broad shader-model compatibility.
@@ -12899,6 +12901,350 @@ RDX_BRDFResult_RT RDX_BRDF_RT(RDX_BRDFParams params)
   }
 
   return result;
+}
+
+// ============================================================================
+// 4.8  EON — Energy-Preserving Oren–Nayar Diffuse BRDF
+// ----------------------------------------------------------------------------
+// Portsmouth, Kutz & Hill 2025 — "EON: A Practical Energy-Preserving
+// Rough Diffuse BRDF"
+//
+// An analytically energy-compensated Oren–Nayar model that replaces Lambert
+// (albedo / PI) for rough diffuse surfaces.  Compared to Hammon 2017 (§3.1):
+//
+//   • Exact energy preservation via multi-scatter geometric series
+//   • Oren–Nayar backscattering peak at grazing configurations
+//   • Directional albedo function E_EON for furnace-test balance
+//   • CLTC importance sampling for efficient path tracing (§4.8e–g)
+//
+// The model operates in tangent space where z = surface normal.  All
+// direction vectors (wi, wo) must be in this local frame.
+//
+// Placement in Part IV because the CLTC importance sampling is designed
+// for Monte Carlo / path tracing.  The evaluation functions (§4.8a–c)
+// can also be used in rasterisation if tangent-space directions are
+// available.
+// ============================================================================
+
+// -- Constants for Fujii Oren–Nayar (FON) base model -------------------------
+static const float EON_CONSTANT1_FON = 0.5 - 2.0 / (3.0 * 3.14159265);
+static const float EON_CONSTANT2_FON = 2.0 / 3.0 - 28.0 / (15.0 * 3.14159265);
+
+// -- 4.8a.  FON Directional Albedo — Exact ------------------------------------
+//
+// Computes the directional albedo of the Fujii Oren–Nayar (FON) base
+// model using the exact closed-form expression.
+//
+// Parameters:
+//   mu – cos(theta), i.e. the z-component of the direction vector
+//   r  – roughness [0,1]
+//
+// Returns:  FON directional albedo E_FON(mu, r).
+
+float EON_E_FON_Exact(float mu, float r)
+{
+  float AF = 1.0 / (1.0 + EON_CONSTANT1_FON * r);
+  float BF = r * AF;
+  float Si = sqrt(1.0 - mu * mu);
+  float G  = Si * (acos(clamp(mu, -1.0, 1.0)) - Si * mu)
+           + (2.0 / 3.0) * ((Si / max(mu, 1e-7)) * (1.0 - Si * Si * Si) - Si);
+  return AF + (BF * (1.0 / 3.14159265)) * G;
+}
+
+// -- 4.8b.  FON Directional Albedo — Fast Approximation -----------------------
+//
+// Polynomial fit to E_FON.  ~4× cheaper than the exact version.
+// Max error < 0.003 over the full (mu, r) domain.
+
+float EON_E_FON_Approx(float mu, float r)
+{
+  float mucomp = 1.0 - mu;
+  static const float g1 = 0.0571085289;
+  static const float g2 = 0.491881867;
+  static const float g3 = -0.332181442;
+  static const float g4 = 0.0714429953;
+  float GoverPi = mucomp * (g1 + mucomp * (g2 + mucomp * (g3 + mucomp * g4)));
+  return (1.0 + r * GoverPi) / (1.0 + EON_CONSTANT1_FON * r);
+}
+
+// -- 4.8c.  EON BRDF Evaluation -----------------------------------------------
+//
+// Evaluates the full EON BRDF value (single-scatter + multi-scatter).
+//
+// Parameters:
+//   rho       – single-scattering albedo (base colour, linear RGB)
+//   r         – roughness [0,1]
+//   wi_local  – incident direction in tangent space (z = normal)
+//   wo_local  – outgoing direction in tangent space (z = normal)
+//   useExact  – true = exact E_FON, false = fast polynomial approximation
+//
+// Returns:  BRDF value f(wi, wo) as float3.
+//           Multiply by NdotL * lightColor externally.
+
+float3 EON_BRDF(
+    float3 rho,
+    float  r,
+    float3 wi_local,
+    float3 wo_local,
+    bool   useExact = false)
+{
+  float mu_i = wi_local.z;
+  float mu_o = wo_local.z;
+
+  // QON s term: azimuthal / planar component of the dot product
+  float s = dot(wi_local, wo_local) - mu_i * mu_o;
+
+  // FON s/t ratio
+  float sovertF = (s > 0.0) ? (s / max(mu_i, mu_o)) : s;
+
+  // FON A coefficient
+  float AF = 1.0 / (1.0 + EON_CONSTANT1_FON * r);
+
+  // Single-scatter lobe
+  float3 f_ss = (rho * (1.0 / 3.14159265)) * AF * (1.0 + r * sovertF);
+
+  // Directional albedos
+  float EFo = useExact ? EON_E_FON_Exact(mu_o, r) : EON_E_FON_Approx(mu_o, r);
+  float EFi = useExact ? EON_E_FON_Exact(mu_i, r) : EON_E_FON_Approx(mu_i, r);
+
+  // Average albedo
+  float avgEF = AF * (1.0 + EON_CONSTANT2_FON * r);
+
+  // Multi-scatter albedo (geometric series for infinite inter-reflections)
+  float3 rho_ms = (rho * rho) * avgEF / (1.0 - rho * (1.0 - avgEF));
+
+  // Multi-scatter lobe
+  static const float eps = 1e-7;
+  float3 f_ms = (rho_ms * (1.0 / 3.14159265))
+              * max(eps, 1.0 - EFo)
+              * max(eps, 1.0 - EFi)
+              / max(eps, 1.0 - avgEF);
+
+  return f_ss + f_ms;
+}
+
+// -- 4.8d.  EON Directional Albedo --------------------------------------------
+//
+// Computes the directional albedo E_EON(wi) — the hemispherical integral
+// of the EON BRDF over all outgoing directions.  Useful for:
+//   • Furnace tests (should return rho for energy conservation)
+//   • Balancing diffuse vs. specular energy in a unified BRDF
+//   • Pre-integrated diffuse for split-sum IBL
+//
+// Parameters:
+//   rho       – single-scattering albedo
+//   r         – roughness [0,1]
+//   wi_local  – incident direction in tangent space
+//   useExact  – true = exact, false = approx
+//
+// Returns:  directional albedo E(wi) as float3.
+
+float3 EON_DirectionalAlbedo(
+    float3 rho,
+    float  r,
+    float3 wi_local,
+    bool   useExact = false)
+{
+  float mu_i = wi_local.z;
+  float AF   = 1.0 / (1.0 + EON_CONSTANT1_FON * r);
+  float EF   = useExact ? EON_E_FON_Exact(mu_i, r) : EON_E_FON_Approx(mu_i, r);
+  float avgEF = AF * (1.0 + EON_CONSTANT2_FON * r);
+  float3 rho_ms = (rho * rho) * avgEF / (1.0 - rho * (1.0 - avgEF));
+  return rho * EF + rho_ms * (1.0 - EF);
+}
+
+// -- 4.8e.  LTC Lobe Coefficients for CLTC Sampling ---------------------------
+//
+// Fitted coefficients a, b, c, d of the Linearly Transformed Cosine (LTC)
+// matrix M that approximates the EON BRDF lobe shape for importance sampling.
+//
+// Parameters:
+//   mu – cos(theta) of the outgoing direction
+//   r  – roughness [0,1]
+//
+// Outputs (by reference):
+//   a, b, c, d – matrix coefficients for M = {{a, 0, b}, {0, c, 0}, {d, 0, 1}}
+
+void EON_LTC_Coefficients(
+    float mu, float r,
+    out float a, out float b, out float c, out float d)
+{
+  a = 1.0 + r * (0.303392 + (-0.518982 + 0.111709 * mu) * mu
+          + (-0.276266 + 0.335918 * mu) * r);
+  b = r * (-1.16407 + 1.15859 * mu + (0.150815 - 0.150105 * mu) * r)
+      / (mu * mu * mu - 1.43545);
+  c = 1.0 + r * (0.20013 + (-0.506373 + 0.261777 * mu) * mu);
+  d = r * (0.540852 + (-1.01625 + 0.475392 * mu) * mu)
+      / (-1.0743 + (0.0725628 + mu) * mu);
+}
+
+// -- 4.8f.  CLTC Importance Sampling ------------------------------------------
+//
+// Samples an incident direction wi from the Clipped Linearly Transformed
+// Cosine (CLTC) lobe fitted to the EON BRDF.  This provides dramatically
+// lower variance than cosine-weighted sampling at grazing angles (>100×).
+//
+// Parameters:
+//   wo_local – outgoing direction in tangent space (z = normal)
+//   r        – roughness [0,1]
+//   u1, u2   – uniform random numbers in [0, 1]
+//
+// Returns:  float4(wi_local.xyz, pdf)
+//           wi_local = sampled incident direction in tangent space
+//           pdf = probability density of the sample
+
+// Helper: orthonormal basis aligned with the azimuthal direction of w
+float3x3 EON_OrthonormalBasisLTC(float3 w)
+{
+  float lenSqr = dot(w.xy, w.xy);
+  float3 X = (lenSqr > 0.0)
+           ? float3(w.x, w.y, 0.0) * rsqrt(lenSqr)
+           : float3(1, 0, 0);
+  float3 Y = float3(-X.y, X.x, 0.0);  // cross(Z, X)
+  return float3x3(X, Y, float3(0, 0, 1));
+}
+
+// CLTC sample from the LTC lobe
+float4 EON_CLTC_Sample(float3 wo_local, float r, float u1, float u2)
+{
+  float a, b, c, d;
+  EON_LTC_Coefficients(wo_local.z, r, a, b, c, d);
+
+  // CLTC sampling on the clipped cosine hemisphere
+  float R   = sqrt(u1);
+  float phi = 2.0 * 3.14159265 * u2;
+  float x   = R * cos(phi);
+  float y   = R * sin(phi);
+
+  float vz = 1.0 / sqrt(d * d + 1.0);
+  float s  = 0.5 * (1.0 + vz);
+  x = -lerp(sqrt(1.0 - y * y), x, s);
+
+  // Hemispherical sample wH
+  float3 wh = float3(x, y, sqrt(max(1.0 - (x * x + y * y), 0.0)));
+  float pdf_wh = wh.z / (3.14159265 * s);
+
+  // Apply LTC matrix M to get wi (unnormalized)
+  float3 wi = float3(a * wh.x + b * wh.z,
+                     c * wh.y,
+                     d * wh.x + wh.z);
+  float len  = length(wi);
+  float detM = c * (a - b * d);
+  float pdf_wi = pdf_wh * len * len * len / detM;
+
+  // Transform from LTC space to tangent space.
+  // HLSL float3x3(X,Y,Z) stores X,Y,Z as rows (vs GLSL columns), so
+  // mul(v, M) = v.x*X + v.y*Y + v.z*Z = the fromLTC (reconstruction) direction.
+  float3x3 fromLTC = EON_OrthonormalBasisLTC(wo_local);
+  wi = normalize(mul(wi, fromLTC));
+
+  return float4(wi, pdf_wi);
+}
+
+// CLTC PDF evaluation for a given wi direction
+float EON_CLTC_Pdf(float3 wo_local, float3 wi_local, float r)
+{
+  // HLSL float3x3(X,Y,Z) stores X,Y,Z as rows, so mul(M, v) = [dot(X,v), dot(Y,v), dot(Z,v)]
+  // which is the toLTC (projection onto axes) direction — no transpose needed.
+  float3 wi = mul(EON_OrthonormalBasisLTC(wo_local), wi_local);
+
+  float a, b, c, d;
+  EON_LTC_Coefficients(wo_local.z, r, a, b, c, d);
+
+  float detM = c * (a - b * d);
+
+  // adj(M) * wi  (inverse direction mapping)
+  float3 wh = float3(
+      c * (wi.x - b * wi.z),
+      (a - b * d) * wi.y,
+      -c * (d * wi.x - a * wi.z));
+  float lenSqr = dot(wh, wh);
+
+  float vz = 1.0 / sqrt(d * d + 1.0);
+  float s  = 0.5 * (1.0 + vz);
+
+  return detM * detM / (lenSqr * lenSqr) * max(wh.z, 0.0) / (3.14159265 * s);
+}
+
+// -- 4.8g.  EON Importance Sampling (MIS: CLTC + Uniform) ---------------------
+//
+// Mixed importance sampling strategy that combines CLTC sampling (efficient
+// for the peaked lobe) with uniform hemisphere sampling (catches the diffuse
+// tail).  Uses fitted probability weights for optimal MIS.
+//
+// Parameters:
+//   wo_local – outgoing direction in tangent space
+//   r        – roughness [0,1]
+//   u1, u2   – uniform random numbers in [0, 1]
+//
+// Returns:  float4(wi_local.xyz, pdf)
+
+// Helper: uniform hemisphere sample
+float3 EON_UniformLobeSample(float u1, float u2)
+{
+  float sinTheta = sqrt(1.0 - u1 * u1);
+  float phi = 2.0 * 3.14159265 * u2;
+  return float3(sinTheta * cos(phi), sinTheta * sin(phi), u1);
+}
+
+float4 EON_Sample(
+    float3 wo_local,
+    float  r,
+    float  u1,
+    float  u2)
+{
+  float mu = wo_local.z;
+
+  // Fitted probability of choosing the uniform lobe
+  float P_u = pow(r, 0.1)
+            * (0.162925 + (-0.372058 + (0.538233 - 0.290822 * mu) * mu) * mu);
+  float P_c = 1.0 - P_u;
+
+  float4 wi;
+  float  pdf_c;
+
+  if (u1 <= P_u) {
+    // Sample from uniform hemisphere lobe
+    u1 = u1 / P_u;
+    wi = float4(EON_UniformLobeSample(u1, u2), 0.0);
+    pdf_c = EON_CLTC_Pdf(wo_local, wi.xyz, r);
+  } else {
+    // Sample from CLTC lobe
+    u1 = (u1 - P_u) / P_c;
+    wi = EON_CLTC_Sample(wo_local, r, u1, u2);
+    pdf_c = wi.w;
+  }
+
+  static const float pdf_u = 1.0 / (2.0 * 3.14159265);
+  wi.w = P_u * pdf_u + P_c * pdf_c;  // MIS combined PDF
+  return wi;
+}
+
+// -- 4.8h.  EON Sampling PDF --------------------------------------------------
+//
+// Evaluates the PDF of the MIS sampling strategy for a given direction pair.
+// Use this when the sample was generated by another strategy (e.g. light
+// sampling) and you need the EON PDF for MIS weighting.
+//
+// Parameters:
+//   wo_local – outgoing direction in tangent space
+//   wi_local – incident direction in tangent space
+//   r        – roughness [0,1]
+//
+// Returns:  PDF value (probability per steradian).
+
+float EON_SamplingPdf(
+    float3 wo_local,
+    float3 wi_local,
+    float  r)
+{
+  float mu = wo_local.z;
+  float P_u = pow(r, 0.1)
+            * (0.162925 + (-0.372058 + (0.538233 - 0.290822 * mu) * mu) * mu);
+  float P_c = 1.0 - P_u;
+  float pdf_c = EON_CLTC_Pdf(wo_local, wi_local, r);
+  static const float pdf_u = 1.0 / (2.0 * 3.14159265);
+  return P_u * pdf_u + P_c * pdf_c;
 }
 
 }  // namespace rendering
