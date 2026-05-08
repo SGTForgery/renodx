@@ -634,7 +634,6 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       if (!reshade::register_addon(h_module)) return FALSE;
 
       renodx::mods::shader::allow_multiple_push_constants = true;
-      renodx::mods::shader::expand_existing_constant_buffer = true;
       renodx::mods::shader::minimum_constant_buffer_stages = reshade::api::shader_stage::pixel | reshade::api::shader_stage::compute;
 
       renodx::utils::resource::upgrade::Use(fdw_reason);

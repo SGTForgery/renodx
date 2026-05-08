@@ -1,5 +1,5 @@
 #include "./shared.h"
-#include "../../shaders/color/macleod_boynton.hlsl"
+#include "./macleod_boynton_purity.hlsl"
 
 // Interleaved Gradient Noise (Jimenez 2014)
 // Returns a scalar in [0,1) with good spatial blue-noise properties.

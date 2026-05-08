@@ -1,4 +1,5 @@
 #include "../common.hlsl"
+#include "../poe2_rendering.hlsli"
 
 static float _193 = 0.0f;
 

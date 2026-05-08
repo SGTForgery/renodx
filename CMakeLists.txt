@@ -68,12 +68,6 @@ find_program(SPIRV_CROSS_BIN spirv-cross.exe
   ${CMAKE_CURRENT_SOURCE_DIR}/bin/)
 message("SPIRV_CROSS_BIN: " ${SPIRV_CROSS_BIN})
 
-find_program(GLSLANG_BIN glslangValidator.exe
-  HINTS
-  ${VULKAN_SDK_PATH}/Bin
-  ${CMAKE_CURRENT_SOURCE_DIR}/bin/)
-message("GLSLANG_BIN: " ${GLSLANG_BIN})
-
 file(TO_CMAKE_PATH "${SPIRV_CROSS_BIN}" SPIRV_CROSS_BIN_CMAKE_PATH)
 
 set(SPIRV_VAL_SCRIPT ${CMAKE_CURRENT_BINARY_DIR}/spirv_val.cmake)
@@ -507,61 +501,6 @@ function(build_shader_target ADDON ADDON_PATH)
     endif()
   endforeach()
 
-  # GLSL shader compilation (Vulkan GLSL -> SPIR-V via glslangValidator)
-  if(GLSLANG_BIN)
-    file(GLOB_RECURSE SHADER_GLSL_SOURCES CONFIGURE_DEPENDS ${ADDON_PATH}/*.glsl)
-    foreach(FILE ${SHADER_GLSL_SOURCES})
-      cmake_path(GET FILE FILENAME FILENAME)
-      cmake_path(GET FILE PARENT_PATH TARGET_PATH)
-      cmake_path(GET TARGET_PATH FILENAME FOLDER_NAME)
-      if(FOLDER_NAME MATCHES "^\\.")
-        continue()
-      endif()
-
-      string(REGEX MATCH "(.*)\\.([^.]+)\\.glsl$" _ ${FILENAME})
-      set(SHADER_NAME ${CMAKE_MATCH_1})
-      set(SHADER_TARGET ${CMAKE_MATCH_2})
-
-      if(SHADER_NAME)
-        string(REGEX MATCH "(0x[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f])$" _ ${SHADER_NAME})
-        set(SHADER_HASH ${CMAKE_MATCH_1})
-      endif()
-
-      if(SHADER_TARGET AND (SHADER_HASH OR SHADER_NAME))
-        if(SHADER_TARGET STREQUAL "frag" OR SHADER_TARGET STREQUAL "vert" OR SHADER_TARGET STREQUAL "comp")
-          set(GLSL_OUTPUT_NAME ${SHADER_HASH})
-          if(NOT GLSL_OUTPUT_NAME)
-            set(GLSL_OUTPUT_NAME ${SHADER_NAME})
-          endif()
-
-          if(SPIRV_VAL_BIN)
-            add_custom_command(
-              OUTPUT ${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spv
-              COMMAND ${GLSLANG_BIN} -V --target-env vulkan1.1 -S ${SHADER_TARGET} ${FILE} -o ${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spv
-              COMMAND ${CMAKE_COMMAND} -DVALIDATOR="${SPIRV_VAL_BIN}" -DFILE="${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spv" -DFLAGS="${SPIRV_VAL_FLAGS_STR}" -P ${SPIRV_VAL_SCRIPT}
-              DEPENDS ${FILE}
-            )
-          else()
-            add_custom_command(
-              OUTPUT ${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spv
-              COMMAND ${GLSLANG_BIN} -V --target-env vulkan1.1 -S ${SHADER_TARGET} ${FILE} -o ${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spv
-              DEPENDS ${FILE}
-            )
-          endif()
-          list(APPEND SHADER_BINARIES ${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spv)
-          if(SPIRV_DIS_BIN)
-            add_custom_command(
-              OUTPUT ${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spvasm
-              COMMAND "${SPIRV_DIS_BIN}" "${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spv" -o "${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spvasm"
-              DEPENDS ${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spv
-            )
-            list(APPEND SHADER_AUX_OUTPUTS ${EMBED_FOLDER}/${GLSL_OUTPUT_NAME}.spvasm)
-          endif()
-        endif()
-      endif()
-    endforeach()
-  endif()
-
   file(GLOB_RECURSE SHADER_CSO_FILES CONFIGURE_DEPENDS ${ADDON_PATH}/*.cso)
   foreach(FILE ${SHADER_CSO_FILES})
     cmake_path(GET FILE FILENAME FILENAME)
@@ -596,60 +535,52 @@ function(build_shader_target ADDON ADDON_PATH)
     endif()
 
     if(SHADER_HASH)
-      # Skip if already built by the GLSL compilation loop
-      list(FIND SHADER_BINARIES ${EMBED_FOLDER}/${SHADER_HASH}.spv _SPV_ALREADY_BUILT)
-      if(_SPV_ALREADY_BUILT EQUAL -1)
-        if(SPIRV_VAL_BIN)
-          add_custom_command(
-            OUTPUT ${EMBED_FOLDER}/${SHADER_HASH}.spv
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FILE} ${EMBED_FOLDER}/${SHADER_HASH}.spv
-            COMMAND ${CMAKE_COMMAND} -DVALIDATOR="${SPIRV_VAL_BIN}" -DFILE="${EMBED_FOLDER}/${SHADER_HASH}.spv" -DFLAGS="${SPIRV_VAL_FLAGS_STR}" -P ${SPIRV_VAL_SCRIPT}
-            DEPENDS ${FILE}
-          )
-        else()
-          add_custom_command(
-            OUTPUT ${EMBED_FOLDER}/${SHADER_HASH}.spv
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FILE} ${EMBED_FOLDER}/${SHADER_HASH}.spv
-            DEPENDS ${FILE}
-          )
-        endif()
-        list(APPEND SHADER_BINARIES ${EMBED_FOLDER}/${SHADER_HASH}.spv)
-        if(SPIRV_DIS_BIN)
-          add_custom_command(
-            OUTPUT ${EMBED_FOLDER}/${SHADER_HASH}.spvasm
-            COMMAND "${SPIRV_DIS_BIN}" "${EMBED_FOLDER}/${SHADER_HASH}.spv" -o "${EMBED_FOLDER}/${SHADER_HASH}.spvasm"
-            DEPENDS ${FILE}
-          )
-          list(APPEND SHADER_AUX_OUTPUTS ${EMBED_FOLDER}/${SHADER_HASH}.spvasm)
-        endif()
+      if(SPIRV_VAL_BIN)
+        add_custom_command(
+          OUTPUT ${EMBED_FOLDER}/${SHADER_HASH}.spv
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FILE} ${EMBED_FOLDER}/${SHADER_HASH}.spv
+          COMMAND ${CMAKE_COMMAND} -DVALIDATOR="${SPIRV_VAL_BIN}" -DFILE="${EMBED_FOLDER}/${SHADER_HASH}.spv" -DFLAGS="${SPIRV_VAL_FLAGS_STR}" -P ${SPIRV_VAL_SCRIPT}
+          DEPENDS ${FILE}
+        )
+      else()
+        add_custom_command(
+          OUTPUT ${EMBED_FOLDER}/${SHADER_HASH}.spv
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FILE} ${EMBED_FOLDER}/${SHADER_HASH}.spv
+          DEPENDS ${FILE}
+        )
+      endif()
+      list(APPEND SHADER_BINARIES ${EMBED_FOLDER}/${SHADER_HASH}.spv)
+      if(SPIRV_DIS_BIN)
+        add_custom_command(
+          OUTPUT ${EMBED_FOLDER}/${SHADER_HASH}.spvasm
+          COMMAND "${SPIRV_DIS_BIN}" "${EMBED_FOLDER}/${SHADER_HASH}.spv" -o "${EMBED_FOLDER}/${SHADER_HASH}.spvasm"
+          DEPENDS ${FILE}
+        )
+        list(APPEND SHADER_AUX_OUTPUTS ${EMBED_FOLDER}/${SHADER_HASH}.spvasm)
       endif()
     elseif(SHADER_NAME)
-      # Skip if already built by the GLSL compilation loop
-      list(FIND SHADER_BINARIES ${EMBED_FOLDER}/${SHADER_NAME}.spv _SPV_ALREADY_BUILT)
-      if(_SPV_ALREADY_BUILT EQUAL -1)
-        if(SPIRV_VAL_BIN)
-          add_custom_command(
-            OUTPUT ${EMBED_FOLDER}/${SHADER_NAME}.spv
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FILE} ${EMBED_FOLDER}/${SHADER_NAME}.spv
-            COMMAND ${CMAKE_COMMAND} -DVALIDATOR="${SPIRV_VAL_BIN}" -DFILE="${EMBED_FOLDER}/${SHADER_NAME}.spv" -DFLAGS="${SPIRV_VAL_FLAGS_STR}" -P ${SPIRV_VAL_SCRIPT}
-            DEPENDS ${FILE}
-          )
-        else()
-          add_custom_command(
-            OUTPUT ${EMBED_FOLDER}/${SHADER_NAME}.spv
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FILE} ${EMBED_FOLDER}/${SHADER_NAME}.spv
-            DEPENDS ${FILE}
-          )
-        endif()
-        list(APPEND SHADER_BINARIES ${EMBED_FOLDER}/${SHADER_NAME}.spv)
-        if(SPIRV_DIS_BIN)
-          add_custom_command(
-            OUTPUT ${EMBED_FOLDER}/${SHADER_NAME}.spvasm
-            COMMAND "${SPIRV_DIS_BIN}" "${EMBED_FOLDER}/${SHADER_NAME}.spv" -o "${EMBED_FOLDER}/${SHADER_NAME}.spvasm"
-            DEPENDS ${FILE}
-          )
-          list(APPEND SHADER_AUX_OUTPUTS ${EMBED_FOLDER}/${SHADER_NAME}.spvasm)
-        endif()
+      if(SPIRV_VAL_BIN)
+        add_custom_command(
+          OUTPUT ${EMBED_FOLDER}/${SHADER_NAME}.spv
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FILE} ${EMBED_FOLDER}/${SHADER_NAME}.spv
+          COMMAND ${CMAKE_COMMAND} -DVALIDATOR="${SPIRV_VAL_BIN}" -DFILE="${EMBED_FOLDER}/${SHADER_NAME}.spv" -DFLAGS="${SPIRV_VAL_FLAGS_STR}" -P ${SPIRV_VAL_SCRIPT}
+          DEPENDS ${FILE}
+        )
+      else()
+        add_custom_command(
+          OUTPUT ${EMBED_FOLDER}/${SHADER_NAME}.spv
+          COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FILE} ${EMBED_FOLDER}/${SHADER_NAME}.spv
+          DEPENDS ${FILE}
+        )
+      endif()
+      list(APPEND SHADER_BINARIES ${EMBED_FOLDER}/${SHADER_NAME}.spv)
+      if(SPIRV_DIS_BIN)
+        add_custom_command(
+          OUTPUT ${EMBED_FOLDER}/${SHADER_NAME}.spvasm
+          COMMAND "${SPIRV_DIS_BIN}" "${EMBED_FOLDER}/${SHADER_NAME}.spv" -o "${EMBED_FOLDER}/${SHADER_NAME}.spvasm"
+          DEPENDS ${FILE}
+        )
+        list(APPEND SHADER_AUX_OUTPUTS ${EMBED_FOLDER}/${SHADER_NAME}.spvasm)
       endif()
     endif()
   endforeach()
