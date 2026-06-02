@@ -255,15 +255,18 @@ inline ToolResult HandleGetShaderTool(const json& arguments, const ToolContext& 
   json sections = json::object();
   std::vector<std::string_view> section_names;
   std::size_t unavailable_sections = 0u;
+  std::vector<std::pair<std::string_view, TextSectionSummary>> text_sections;
 
   const auto append_section = [&](std::string_view key, const std::function<TextSection(std::uint32_t, std::uint32_t)>& callback) {
     if (!callback) {
-      sections[std::string(key)] = TextSectionSummary(
+      auto summary = TextSectionSummary(
           TextSection{
               .available = false,
               .error = std::format("{} is not available in this MCP session.", key),
           },
           max_text_length);
+      sections[std::string(key)] = summary;
+      text_sections.emplace_back(key, summary);
       unavailable_sections += 1u;
       section_names.push_back(key);
       return;
@@ -273,7 +276,9 @@ inline ToolResult HandleGetShaderTool(const json& arguments, const ToolContext& 
     if (!section.available) {
       unavailable_sections += 1u;
     }
-    sections[std::string(key)] = TextSectionSummary(section, max_text_length);
+    auto summary = TextSectionSummary(section, max_text_length);
+    sections[std::string(key)] = summary;
+    text_sections.emplace_back(key, summary);
     section_names.push_back(key);
   };
 
@@ -289,14 +294,36 @@ inline ToolResult HandleGetShaderTool(const json& arguments, const ToolContext& 
   }
 
   auto text = std::format(
-      "Returned shader {} from device #{}.",
+      "Shader {} on device #{}: stage={} source={} entry={}",
       internal::FormatShaderHash(shader_hash),
-      device_index);
+      device_index,
+      shader_summary.stage,
+      shader_summary.source,
+      shader_summary.entrypoint);
+  if (shader_summary.program_version.has_value()) {
+    text += std::format(" program={}", shader_summary.program_version.value());
+  }
+  if (shader_summary.has_disk_shader) {
+    text += " [disk]";
+  }
+  if (shader_summary.has_addon_shader) {
+    text += " [addon]";
+  }
   if (!section_names.empty()) {
-    text += std::format(" Included {}.", internal::DescribeSections(section_names));
+    text += std::format("\nIncluded {}.", internal::DescribeSections(section_names));
   }
   if (unavailable_sections != 0u) {
     text += std::format(" {} requested section(s) were unavailable.", unavailable_sections);
+  }
+  for (const auto& [key, summary] : text_sections) {
+    if (summary.available && summary.text.has_value()) {
+      text += std::format("\n--- {} ---\n{}", key, summary.text.value());
+      if (summary.truncated) {
+        text += std::format("\n[truncated: returned {}/{} chars]", summary.returned_length.value(), summary.full_length.value());
+      }
+    } else if (summary.error.has_value()) {
+      text += std::format("\n--- {} --- (unavailable: {})", key, summary.error.value());
+    }
   }
 
   return ToolResult{

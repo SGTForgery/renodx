@@ -166,24 +166,23 @@ void frag_main()
     }
     float _380 = _200.x;
     float3 _sceneColor = _377.xyz * cpost_processing_desc_cb_original_intensity;
+
+    // RenoDX: Apply colour grading BEFORE bloom
+    if (RENODX_TONE_MAP_TYPE > 0.f) {
+        UserGradingConfig _pre_cg = CreateColorGradeConfig();
+        float _pre_y = renodx::color::y::from::BT709(_sceneColor);
+        _sceneColor = ApplyExposureContrastFlareHighlightsShadowsByLuminance(
+            _sceneColor, _pre_y, _pre_cg);
+    }
+
     float3 _bloomColor = bloom_sampler.SampleLevel(SamplerLinearClampNoBias, float4(_380, _200.y, 0.0f, 0.0f).xy, 0.0f).xyz;
 
-    // Apply bloom black-floor preservation to suppress bloom in dark regions
+    // Musa's bloom scaling
     _bloomColor = renodx::rendering::BloomScaling(_bloomColor, _sceneColor, BLOOM_SCALING);
 
-    // Scale bloom by user slider (BLOOM_STRENGTH: 0 = off, 1.0 = vanilla, 2.0 = 2x)
     _bloomColor *= BLOOM_STRENGTH;
 
     float3 _396 = (_sceneColor + _bloomColor) * max(1.0f, cpost_processing_desc_cb_exposure);
-
-    // Apply exposure/contrast/flare/highlights/shadows before LUTs
-    // so highlights aren't clamped by the LUT's 0-1 input range
-    if (RENODX_TONE_MAP_TYPE > 0.f) {
-        UserGradingConfig _pre_cg = CreateColorGradeConfig();
-        float _pre_y = renodx::color::y::from::BT709(_396);
-        _396 = ApplyExposureContrastFlareHighlightsShadowsByLuminance(
-            _396, _pre_y, _pre_cg);
-    }
 
     float4 _397 = float4(_396.x, _396.y, _396.z, _377.w);
     float4 _424;
@@ -198,7 +197,7 @@ void frag_main()
         _424 = _397;
         break;
     } while(false);
-    // ColorGradeScene controls desaturation LUT strength
+    // RenoDX: ColorGradeScene controls desaturation LUT strength
     _424 = lerp(_397, _424, saturate(RENODX_COLOR_GRADE_STRENGTH));
     float4 _460;
     if (cpost_processing_desc_cb_post_transform_enable != 0u)
@@ -212,7 +211,7 @@ void frag_main()
     {
         _460 = _424;
     }
-    // ColorGradeScene controls post-transform LUT strength
+    // RenoDX: ColorGradeScene controls post transform LUT strength
     _460 = float4(lerp(_424.xyz, _460.xyz, saturate(RENODX_COLOR_GRADE_STRENGTH)), _460.w);
 
     if (RENODX_TONE_MAP_TYPE > 0.f) {
@@ -225,13 +224,15 @@ void frag_main()
         lut_result.graded = graded_color;
         lut_result.y = renodx::color::y::from::BT709(graded_color);
         lut_result.graded_ap1 = renodx::color::ap1::from::BT709(graded_color);
+        lut_result.pre_lut_linear = _396;
 
-        float3 hdr_color = HDRGRADE(lut_result);
+        float3 hdr_color;
+        hdr_color = PSYCHOGRADE(lut_result);
 
         float out_max = max(1.0f, max(hdr_color.r, max(hdr_color.g, hdr_color.b)));
         hdr_color = renodx::color::srgb::EncodeSafe(hdr_color / out_max) * out_max;
 
-        if (RENODX_GAMMA_CORRECTION >= 1.f) {
+        if (RENODX_GAMMA_CORRECTION == 1.f) {
             hdr_color = ApplyGammaCorrectionByLuminance(hdr_color);
         }
         _460 = float4(hdr_color, _460.w);
@@ -297,7 +298,7 @@ void frag_main()
         _492 = _460;
     }
     // Vignette:
-    // Smoothstep to reduce visible circular banding vs the original hard pow.
+    // RenoDX: Smoothstep to reduce visible circular banding vs the original hard pow.
     float _vignette_dist = length(_200 - 0.5f.xx) * 1.41421353816986083984375f; // 0..1 from center to corner
     float _vignette_falloff = 1.0f - smoothstep(0.0f, 1.0f, _vignette_dist * _vignette_dist);
     float _vignette_factor = lerp(1.0f, lerp(_vignette_falloff, 1.0f, 0.1500000059604644775390625f), saturate(VIGNETTE_STRENGTH));
@@ -972,7 +973,8 @@ void frag_main()
         _2785 = float4((_515.xyz * (1.0f - clamp(_2773.w, 0.0f, 1.0f))) + _2773.xyz, _193);
         break;
     } while(false);
-    // Hardcode-disable vanilla in-game brightness slider (hdr_scale).
+
+    // RenoDX: Disable vanilla in game brightness slider (hdr_scale)
     float4 _2788 = _2785 * 2.5f * (RENODX_DIFFUSE_WHITE_NITS / 203.f);
     _2788.w = _227.w;
     out_var_SV_TARGET = _2788;

@@ -69,6 +69,8 @@ void frag_main()
     float3 _193 = float4(_185.xyz * 2.0f.xxx, _188).xyz;
     float4 _203 = float4(lerp(dot(_117, float3(0.300000011920928955078125f, 0.589999973773956298828125f, 0.10999999940395355224609375f)).xxx, _117, 0.5f.xxx), _116.w) + ((float4(lerp(dot(_193, float3(0.300000011920928955078125f, 0.589999973773956298828125f, 0.10999999940395355224609375f)).xxx, _193, 0.25f.xxx), _188) * _108) * 3.0f);
     float3 _tonemapped = _203.xyz * 2.0f;
+
+    //RenoDX:
     if (RENODX_TONE_MAP_TYPE > 0.f) {
       _tonemapped = renodx::color::bt2020::from::BT709(_tonemapped);
       _tonemapped = renodx::tonemap::neutwo::MaxChannel(

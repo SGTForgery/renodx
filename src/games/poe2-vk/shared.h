@@ -18,35 +18,18 @@ struct ShaderInjectData {
   float tone_map_blowout;
   float tone_map_dechroma;
   float tone_map_flare;
-  float tone_map_hue_correction;
   float tone_map_hue_shift;
-  float tone_map_working_color_space;
-  float tone_map_clamp_color_space;
-  float tone_map_clamp_peak;
-  float tone_map_hue_processor;
-  float tone_map_per_channel;
   float gamma_correction;
-  float intermediate_scaling;
-  float intermediate_encoding;
-  float intermediate_color_space;
-  float swap_chain_decoding;
   float swap_chain_gamma_correction;
-  // float swap_chain_decoding_color_space;
-  float swap_chain_custom_color_space;
-  // float swap_chain_scaling_nits;
-  // float swap_chain_clamp_nits;
-  float swap_chain_clamp_color_space;
-  float swap_chain_encoding;
-  float swap_chain_encoding_color_space;
-  float reno_drt_tone_map_method;
   float custom_random;
   float custom_grain_strength;
   float vignette_strength;
   float bloom_strength;
   float bloom_scaling;
-  float perchannelblowout;
-  float ao_strength;
   float hide_ui;
+  float hue_correction;
+  float lava_hue_correction;
+  float lava_saturation;
 };
 
 #ifndef __cplusplus
@@ -84,13 +67,7 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_DIFFUSE_WHITE_NITS              shader_injection.diffuse_white_nits
 #define RENODX_GRAPHICS_WHITE_NITS             shader_injection.graphics_white_nits
 #define RENODX_GAMMA_CORRECTION                shader_injection.gamma_correction
-#define RENODX_TONE_MAP_PER_CHANNEL            shader_injection.tone_map_per_channel
-#define RENODX_TONE_MAP_WORKING_COLOR_SPACE    shader_injection.tone_map_working_color_space
-#define RENODX_TONE_MAP_HUE_PROCESSOR          shader_injection.tone_map_hue_processor
-#define RENODX_TONE_MAP_HUE_CORRECTION         shader_injection.tone_map_hue_correction
 #define RENODX_TONE_MAP_HUE_SHIFT              shader_injection.tone_map_hue_shift
-#define RENODX_TONE_MAP_CLAMP_COLOR_SPACE      shader_injection.tone_map_clamp_color_space
-#define RENODX_TONE_MAP_CLAMP_PEAK             shader_injection.tone_map_clamp_peak
 #define RENODX_TONE_MAP_EXPOSURE               shader_injection.tone_map_exposure
 #define RENODX_TONE_MAP_HIGHLIGHTS             shader_injection.tone_map_highlights
 #define RENODX_TONE_MAP_SHADOWS                shader_injection.tone_map_shadows
@@ -101,27 +78,16 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_TONE_MAP_DECHROMA               shader_injection.tone_map_dechroma
 #define RENODX_TONE_MAP_FLARE                  shader_injection.tone_map_flare
 #define RENODX_COLOR_GRADE_STRENGTH            shader_injection.color_grade_strength
-#define RENODX_INTERMEDIATE_ENCODING           shader_injection.intermediate_encoding
-#define RENODX_SWAP_CHAIN_DECODING             shader_injection.swap_chain_decoding
 #define RENODX_SWAP_CHAIN_GAMMA_CORRECTION     shader_injection.swap_chain_gamma_correction
-// #define RENODX_SWAP_CHAIN_DECODING_COLOR_SPACE shader_injection.swap_chain_decoding_color_space
-#define RENODX_SWAP_CHAIN_CUSTOM_COLOR_SPACE   shader_injection.swap_chain_custom_color_space
-// #define RENODX_SWAP_CHAIN_SCALING_NITS      shader_injection.swap_chain_scaling_nits
-// #define RENODX_SWAP_CHAIN_CLAMP_NITS        shader_injection.swap_chain_clamp_nits
-#define RENODX_SWAP_CHAIN_CLAMP_COLOR_SPACE    shader_injection.swap_chain_clamp_color_space
-#define RENODX_SWAP_CHAIN_ENCODING             shader_injection.swap_chain_encoding
-#define RENODX_SWAP_CHAIN_ENCODING_COLOR_SPACE shader_injection.swap_chain_encoding_color_space
-#define RENODX_TONE_MAP_HDR_VIDEO              shader_injection.tone_map_hdr_video
-#define RENODX_VIDEO_NITS                      shader_injection.tone_map_video_nits
-#define RENODX_RENO_DRT_TONE_MAP_METHOD        shader_injection.reno_drt_tone_map_method
+#define RENODX_HIDE_UI                         shader_injection.hide_ui
 #define CUSTOM_RANDOM                          shader_injection.custom_random
 #define CUSTOM_GRAIN_STRENGTH                  shader_injection.custom_grain_strength
 #define VIGNETTE_STRENGTH                      shader_injection.vignette_strength
 #define BLOOM_STRENGTH                         shader_injection.bloom_strength
 #define BLOOM_SCALING                          shader_injection.bloom_scaling
-#define PER_CHANNEL_BLOWOUT                    shader_injection.perchannelblowout
-#define AO_STRENGTH                            shader_injection.ao_strength
-#define RENODX_HIDE_UI                         shader_injection.hide_ui
+#define HUE_CORRECTION                         shader_injection.hue_correction
+#define LAVA_HUE_CORRECTION                    shader_injection.lava_hue_correction
+#define LAVA_SATURATION                        shader_injection.lava_saturation
 
 #include "../../shaders/renodx.hlsl"
 

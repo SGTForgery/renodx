@@ -131,6 +131,8 @@ void frag_main()
     float4 _314 = float4((((((_166.xyz * 3.3299999237060546875f) * _157) * _136) + (((float4((_183.x.xxx + (_159 * _183.y)) * specular_cube.SampleLevel(SamplerLinearClampNoBias, float4(mul(float3(0.0f, 0.0f, -1.0f) - ((_143 * 2.0f) * dot(float3(0.0f, 0.0f, -1.0f), _143)), _161), _196).xyz, _196).xyz, _99) * 3.3299999237060546875f) * 1.0f).xyz * lerp(_136, 1.0f, _153))) + (_220 * 0.0199999995529651641845703125f)) * _308, _308) * in_var_COLOR0;
 
     float3 _tonemapped = _314.xyz;
+
+    // RenoDX:
     if (RENODX_TONE_MAP_TYPE > 0.f) {
       _tonemapped = renodx::color::bt2020::from::BT709(_tonemapped);
       _tonemapped = renodx::tonemap::neutwo::MaxChannel(

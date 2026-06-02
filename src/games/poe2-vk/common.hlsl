@@ -1,10 +1,11 @@
 #include "./shared.h"
 #include "./macleod_boynton_purity.hlsl"
+#include "./psycho_test17_custom.hlsl"
 
 // Interleaved Gradient Noise (Jimenez 2014)
 // Returns a scalar in [0,1) with good spatial blue-noise properties.
 float InterleavedGradientNoise(float2 pixelCoord) {
-  return frac(52.9829189 * frac(0.06711056 * pixelCoord.x + 0.00583715 * pixelCoord.y));
+  return frac(52.9829189f * frac(mad(0.06711056f, pixelCoord.x, 0.00583715f * pixelCoord.y)));
 }
 
 // Luminance-based gamma correction that preserves per-channel chrominance (hue).
@@ -18,10 +19,10 @@ float3 ApplyGammaCorrectionByLuminance(float3 color_input) {
 // Processes UI shader output: neutralizes vanilla sdr_scale, applies UI gamma
 // correction, scales by UI nits, and optionally hides UI for screenshots.
 float4 ApplyUIProcessing(float3 color, float alpha) {
-  if (RENODX_HIDE_UI >= 1.f) {
-    return float4(0.0f, 0.0f, 0.0f, 0.0f);
+  if (RENODX_HIDE_UI == 1.f) {
+    return float4(0.f, 0.f, 0.f, 0.f);
   }
-  if (RENODX_SWAP_CHAIN_GAMMA_CORRECTION >= 1.f) {
+  if (RENODX_SWAP_CHAIN_GAMMA_CORRECTION == 1.f) {
     color = ApplyGammaCorrectionByLuminance(color);
   }
   color *= RENODX_GRAPHICS_WHITE_NITS / 80.f;
@@ -33,24 +34,24 @@ float3 HueAndChrominanceOKLab(
     float hue_correct_strength = 0.f,
     float chrominance_correct_strength = 0.f,
     float saturation = 1.f) {
-  if (hue_correct_strength != 0.0 || chrominance_correct_strength != 0.0 || saturation != 0.0) {
+  if (hue_correct_strength != 0.f || chrominance_correct_strength != 0.f || saturation != 0.f) {
     float3 perceptual_new = renodx::color::oklab::from::BT709(incorrect_color);
     const float3 reference_oklab = renodx::color::oklab::from::BT709(reference_color);
 
     float chrominance_current = length(perceptual_new.yz);
-    float chrominance_ratio = 1.0;
+    float chrominance_ratio = 1.f;
 
-    if (hue_correct_strength != 0.0) {
+    if (hue_correct_strength != 0.f) {
       const float chrominance_pre = chrominance_current;
       perceptual_new.yz = lerp(perceptual_new.yz, reference_oklab.yz, hue_correct_strength);
       const float chrominancePost = length(perceptual_new.yz);
-      chrominance_ratio = renodx::math::SafeDivision(chrominance_pre, chrominancePost, 1);
+      chrominance_ratio = renodx::math::DivideSafe(chrominance_pre, chrominancePost, 1.f);
       chrominance_current = chrominancePost;
     }
 
-    if (chrominance_correct_strength != 0.0) {
+    if (chrominance_correct_strength != 0.f) {
       const float reference_chrominance = length(reference_oklab.yz);
-      float target_chrominance_ratio = renodx::math::SafeDivision(reference_chrominance, chrominance_current, 1);
+      float target_chrominance_ratio = renodx::math::DivideSafe(reference_chrominance, chrominance_current, 1.f);
       chrominance_ratio = lerp(chrominance_ratio, target_chrominance_ratio, chrominance_correct_strength);
     }
     perceptual_new.yz *= chrominance_ratio;
@@ -122,9 +123,8 @@ float3 CorrectHueAndPurityMBGated(
   float3 reference_lms = mul(renodx::color::macleod_boynton::XYZ_TO_LMS_2006,
                              mul(renodx::color::BT2020_TO_XYZ_MAT, reference_color_bt2020));
 
-  float2 white = (mb_white_override.x >= 0.f && mb_white_override.y >= 0.f)
-                     ? mb_white_override
-                     : renodx::color::macleod_boynton::MB_White_D65();
+  bool has_white_override = (mb_white_override.x >= 0.f && mb_white_override.y >= 0.f);
+  float2 white = renodx::math::Select(has_white_override, mb_white_override, renodx::color::macleod_boynton::MB_White_D65());
 
   float2 target_direction = renodx::color::macleod_boynton::MB_From_LMS(target_lms) - white;
   float2 reference_direction = renodx::color::macleod_boynton::MB_From_LMS(reference_lms) - white;
@@ -140,12 +140,14 @@ float3 CorrectHueAndPurityMBGated(
             .rgbOut);
   }
 
-  float2 target_unit = (target_len_sq > renodx::color::macleod_boynton::MB_NEAR_WHITE_EPSILON)
-                           ? target_direction * rsqrt(target_len_sq)
-                           : float2(0.f, 0.f);
-  float2 reference_unit = (reference_len_sq > renodx::color::macleod_boynton::MB_NEAR_WHITE_EPSILON)
-                              ? reference_direction * rsqrt(reference_len_sq)
-                              : target_unit;
+  float2 target_unit = renodx::math::Select(
+      (target_len_sq > renodx::color::macleod_boynton::MB_NEAR_WHITE_EPSILON),
+      (target_direction * rsqrt(target_len_sq)),
+      float2(0.f, 0.f));
+  float2 reference_unit = renodx::math::Select(
+      (reference_len_sq > renodx::color::macleod_boynton::MB_NEAR_WHITE_EPSILON),
+      (reference_direction * rsqrt(reference_len_sq)),
+      target_unit);
   if (target_len_sq <= renodx::color::macleod_boynton::MB_NEAR_WHITE_EPSILON) {
     target_unit = reference_unit;
   }
@@ -153,7 +155,7 @@ float3 CorrectHueAndPurityMBGated(
   float2 blended_unit = lerp(target_unit, reference_unit, hue_blend);
   float blended_len_sq = dot(blended_unit, blended_unit);
   if (blended_len_sq <= renodx::color::macleod_boynton::MB_NEAR_WHITE_EPSILON) {
-    blended_unit = (hue_blend >= 0.5f) ? reference_unit : target_unit;
+    blended_unit = renodx::math::Select((hue_blend >= 0.5f), reference_unit, target_unit);
     blended_len_sq = dot(blended_unit, blended_unit);
   }
   blended_unit *= rsqrt(max(blended_len_sq, 1e-20f));
@@ -207,9 +209,10 @@ float3 ApplyMBLowHueThenHighHueAndPurity(
     return target_bt709;
   }
 
-  float2 white = (mb_white_override.x >= 0.f && mb_white_override.y >= 0.f)
-                     ? mb_white_override
-                     : renodx::color::macleod_boynton::MB_White_D65();
+  float2 white = renodx::math::Select(
+      (mb_white_override.x >= 0.f && mb_white_override.y >= 0.f),
+      mb_white_override,
+      renodx::color::macleod_boynton::MB_White_D65());
 
   float2 target_direction = renodx::color::macleod_boynton::MB_From_LMS(target_lms) - white;
   float2 low_reference_direction = renodx::color::macleod_boynton::MB_From_LMS(low_reference_lms) - white;
@@ -228,9 +231,10 @@ float3 ApplyMBLowHueThenHighHueAndPurity(
     low_unit = high_reference_direction * rsqrt(high_len_sq);
   }
 
-  float2 high_unit = (high_len_sq > kNearWhiteEpsilon)
-                         ? high_reference_direction * rsqrt(high_len_sq)
-                         : low_unit;
+  float2 high_unit = renodx::math::Select(
+      (high_len_sq > kNearWhiteEpsilon),
+      (high_reference_direction * rsqrt(high_len_sq)),
+      low_unit);
 
   float hue_blend = saturate(high_hue_strength) *
                     saturate(renodx::math::DivideSafe(target_t - hue_t_ramp_start,
@@ -306,7 +310,7 @@ UserGradingConfig CreateColorGradeConfig() {
     RENODX_TONE_MAP_DECHROMA,                             // float dechroma;
     RENODX_TONE_MAP_HUE_SHIFT,                            // float hue_emulation_strength;
     -1.f * (RENODX_TONE_MAP_HIGHLIGHT_SATURATION - 1.f),  // float highlight_saturation;
-    RENODX_TONE_MAP_BLOWOUT                               // float chrominance_emulation_strength;
+    0.f                                                    // float chrominance_emulation_strength; (disabled)
   };
   return cg_config;
 }
@@ -370,7 +374,7 @@ float3 ApplyExposureContrastFlareHighlightsShadowsByLuminance(float3 untonemappe
 float3 ApplySaturationBlowoutHueCorrectionHighlightSaturation(float3 tonemapped, float3 hue_reference_color, float y, UserGradingConfig config) {
   float3 color = tonemapped;
   if (config.saturation != 1.f || config.dechroma != 0.f || config.hue_emulation_strength != 0.f || config.chrominance_emulation_strength != 0.f || config.highlight_saturation != 0.f) {
-    if (config.hue_emulation_strength != 0.0 || config.chrominance_emulation_strength != 0.0) {
+    if (config.hue_emulation_strength != 0.f || config.chrominance_emulation_strength != 0.f) {
       color = CorrectHueAndPurityMBGated(
           color,
           hue_reference_color,
@@ -468,6 +472,7 @@ struct LUTSampleResult {
   float3 graded;
   float y;
   float3 graded_ap1;
+  float3 pre_lut_linear;  // raw linear scene color before LUT (for hue reference)
 };
 
 LUTSampleResult LUTSAMPLE(
@@ -521,51 +526,81 @@ float3 SDRGRADE(LUTSampleResult lut_sample) {
   return output;
 }
 
-float3 HDRGRADE(LUTSampleResult lut_sample) {
+float3 PSYCHOGRADE(LUTSampleResult lut_sample) {
   float3 graded = lut_sample.graded;
-  float3 graded_ap1 = lut_sample.graded_ap1;
   float y = lut_sample.y;
   float peak = shader_injection.peak_white_nits / shader_injection.diffuse_white_nits;
 
   UserGradingConfig cg_config = CreateColorGradeConfig();
 
-  float3 output = graded;
+  float3 output = renodx::tonemap::psycho::psychotm_test17(
+      graded,
+      peak,                                // peak_value
+      1.f,                                 // exposure (already applied pre-LUT)
+      1.f,                                 // highlights (already applied pre-LUT)
+      1.f,                                 // shadows (already applied pre-LUT)
+      1.f,                                 // contrast (already applied pre-LUT)
+      1.f,                                 // purity_scale (saturation applied post-tonemap instead)
+      cg_config.chrominance_emulation_strength,  // bleaching_intensity
+      peak * 2.f,                          // clip_point
+      cg_config.hue_emulation_strength,    // hue_restore
+      1.f,                                 // adaptation_contrast
+      0,                                   // white_curve_mode
+      1.f,                                 // cone_response_exponent
+      0.18f,                               // current_adaptive_state_bt709
+      0.18f,                               // current_background_state_bt709
+      1.f,                                 // gamut_compression
+      1);                                  // gamut_compression_mode (BT.2020 bound)
 
-  // Hue shift: blend hue toward per-channel neutwo reference (purity untouched).
-  if (cg_config.hue_emulation_strength != 0.0) {
-    float3 hue_reference = renodx::tonemap::neutwo::PerChannel(graded, 2.f, 65.f);
-    output = CorrectHueAndPurityMBGated(
-        output, hue_reference,
-        cg_config.hue_emulation_strength,
-        0.5f, 1.f,
-        0.f,    // no purity from this reference
-        1.f);
+  // Post-tonemap hue correction using per-channel Neutwo of the PRE-LUT linear
+  // scene color. This matches BG3-VK's approach where the hue reference is
+  // computed from the raw scene color (_84), not the LUT-graded output.
+  // The LUT may shift hue (making fire more pink), so using post-LUT color
+  // as the reference source would give a pink reference — defeating the purpose.
+  // Uses lower t_ramp (0.05, 0.5) because after tonemapping, values are compressed
+  // to display range — the standard (0.5, 1.0) ramp would miss most pixels.
+  if (HUE_CORRECTION > 0.f || cg_config.chrominance_emulation_strength > 0.f) {
+    float3 pre_lut_clamped = max(0, lut_sample.pre_lut_linear);
+    if (HUE_CORRECTION > 0.f) {
+      float3 hue_reference = renodx::tonemap::neutwo::PerChannel(pre_lut_clamped, peak.xxx);
+      output = CorrectHueAndPurityMBGated(
+          output, hue_reference,
+          HUE_CORRECTION,
+          0.05f, 0.5f,
+          0.f);
+    }
+    // Purity restoration: Psycho's per-cone compression desaturates more than
+    // max-channel Neutwo. Blend purity toward max-channel Neutwo reference
+    // to restore saturation in highlights (same approach as BG3-VK).
+    if (cg_config.chrominance_emulation_strength > 0.f) {
+      float3 purity_reference = renodx::tonemap::neutwo::MaxChannel(pre_lut_clamped, peak);
+      output = CorrectHueAndPurityMBGated(
+          output, purity_reference,
+          0.f,           // no hue from this reference
+          0.05f, 0.5f,
+          cg_config.chrominance_emulation_strength);
+    }
   }
 
-  // Blowout: blend purity toward a smoothly compressed reference (hue untouched).
-  // Per-channel neutwo compresses each channel toward peak individually,
-  // so bright saturated channels lose their disproportionate contribution
-  // progressively — no hard clamp boundary, no banding.
-  // hue_strength=0 so only purity is read from this reference.
-  if (cg_config.chrominance_emulation_strength != 0.0) {
-    float3 blowout_reference = renodx::tonemap::neutwo::PerChannel(graded, peak, peak * 2.f);
-    output = CorrectHueAndPurityMBGated(
-        output, blowout_reference,
-        0.f,    // no hue from this reference
-        0.5f, 1.f,
-        cg_config.chrominance_emulation_strength,
-        1.f);
+  // Post-tonemap saturation, dechroma, highlight saturation via MB purity scaling.
+  // Applied here (not inside Psycho) to avoid out-of-gamut breakup from
+  // oversaturation before the Naka-Rushton compression.
+  {
+    UserGradingConfig sat_config = cg_config;
+    sat_config.hue_emulation_strength = 0.f;
+    sat_config.chrominance_emulation_strength = 0.f;
+    float y_out = renodx::color::y::from::BT709(output);
+    output = ApplySaturationBlowoutHueCorrectionHighlightSaturation(
+        output, 0.f, y_out, sat_config);
   }
 
-  // Saturation, dechroma, highlight saturation (skip hue/purity — already handled).
-  UserGradingConfig sat_config = cg_config;
-  sat_config.hue_emulation_strength = 0.f;
-  sat_config.chrominance_emulation_strength = 0.f;
-  output = ApplySaturationBlowoutHueCorrectionHighlightSaturation(
-      output, float3(0, 0, 0), y, sat_config);
+  output = renodx::color::bt709::clamp::AP1(output);
 
-  output = renodx::color::bt2020::from::BT709(output);
-  output = renodx::tonemap::neutwo::MaxChannel(output, peak, 65.f);
-  output = renodx::color::bt709::from::BT2020(output);
+  // Clamp to display peak to prevent overshoot from post-tonemap color ops
+  float psycho_max_channel = max(output.r, max(output.g, output.b));
+  if (psycho_max_channel > peak) {
+    output *= peak / psycho_max_channel;
+  }
+
   return output;
 }

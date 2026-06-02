@@ -1,10 +1,6 @@
 #ifndef SRC_GAMES_POE2_VK_POE2_RENDERING_HLSLI_
 #define SRC_GAMES_POE2_VK_POE2_RENDERING_HLSLI_
 
-// Local rendering helpers for poe2-vk.
-// Extracted from src/shaders/rendering.hlsl to avoid pulling the full 13k-line
-// file into every shader via renodx.hlsl.
-
 namespace renodx {
 namespace rendering {
 

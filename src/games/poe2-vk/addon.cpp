@@ -28,6 +28,88 @@ ShaderInjectData shader_injection;
 
 float current_settings_mode = 0;
 
+// Hotkey state tracking
+bool ui_toggle_key_was_pressed = false;
+int ui_toggle_hotkey = 0;
+bool hotkey_input_active = false;
+
+std::string GetKeyName(int keycode) {
+  if (keycode == 0 || keycode >= 256) return "";
+
+  static const char* keyboard_keys[256] = {
+      "", "Left Mouse", "Right Mouse", "Cancel", "Middle Mouse", "X1 Mouse", "X2 Mouse", "", "Backspace", "Tab", "", "", "Clear", "Enter", "", "",
+      "Shift", "Control", "Alt", "Pause", "Caps Lock", "", "", "", "", "", "", "Escape", "", "", "", "",
+      "Space", "Page Up", "Page Down", "End", "Home", "Left Arrow", "Up Arrow", "Right Arrow", "Down Arrow", "Select", "", "", "Print Screen", "Insert", "Delete", "Help",
+      "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "", "", "", "", "", "",
+      "", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O",
+      "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z", "Left Windows", "Right Windows", "Apps", "", "Sleep",
+      "Numpad 0", "Numpad 1", "Numpad 2", "Numpad 3", "Numpad 4", "Numpad 5", "Numpad 6", "Numpad 7", "Numpad 8", "Numpad 9", "Numpad *", "Numpad +", "", "Numpad -", "Numpad Decimal", "Numpad /",
+      "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12", "F13", "F14", "F15", "F16",
+      "F17", "F18", "F19", "F20", "F21", "F22", "F23", "F24", "", "", "", "", "", "", "", "",
+      "Num Lock", "Scroll Lock", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+      "Left Shift", "Right Shift", "Left Control", "Right Control", "Left Menu", "Right Menu", "Browser Back", "Browser Forward", "Browser Refresh", "Browser Stop", "Browser Search", "Browser Favorites", "Browser Home", "Volume Mute", "Volume Down", "Volume Up",
+      "Next Track", "Previous Track", "Media Stop", "Media Play/Pause", "Mail", "Media Select", "Launch App 1", "Launch App 2", "", "", "OEM ;", "OEM +", "OEM ,", "OEM -", "OEM .", "OEM /",
+      "OEM ~", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "",
+      "", "", "", "", "", "", "", "", "", "", "", "OEM [", "OEM \\", "OEM ]", "OEM '", "OEM 8",
+      "", "", "OEM <", "", "", "", "", "", "", "", "", "", "", "", "", "",
+      "", "", "", "", "", "", "Attn", "CrSel", "ExSel", "Erase EOF", "Play", "Zoom", "", "PA1", "OEM Clear", ""};
+
+  return keyboard_keys[keycode];
+}
+
+int GetLastKeyPressedImGui() {
+  struct KeyMapping {
+    ImGuiKey imgui_key;
+    int vk_code;
+
+    constexpr KeyMapping(ImGuiKey key, int code) : imgui_key(key), vk_code(code) {}
+  };
+
+  static constexpr auto KEY_MAPPINGS = std::to_array<KeyMapping>({
+      // Function keys
+      {ImGuiKey_F1, VK_F1}, {ImGuiKey_F2, VK_F2}, {ImGuiKey_F3, VK_F3}, {ImGuiKey_F4, VK_F4},
+      {ImGuiKey_F5, VK_F5}, {ImGuiKey_F6, VK_F6}, {ImGuiKey_F7, VK_F7}, {ImGuiKey_F8, VK_F8},
+      {ImGuiKey_F9, VK_F9}, {ImGuiKey_F10, VK_F10}, {ImGuiKey_F11, VK_F11}, {ImGuiKey_F12, VK_F12},
+      // Navigation keys
+      {ImGuiKey_Insert, VK_INSERT}, {ImGuiKey_Delete, VK_DELETE}, {ImGuiKey_Home, VK_HOME}, {ImGuiKey_End, VK_END},
+      {ImGuiKey_PageUp, VK_PRIOR}, {ImGuiKey_PageDown, VK_NEXT},
+      // Arrow keys
+      {ImGuiKey_LeftArrow, VK_LEFT}, {ImGuiKey_RightArrow, VK_RIGHT}, {ImGuiKey_UpArrow, VK_UP}, {ImGuiKey_DownArrow, VK_DOWN},
+      // Special keys
+      {ImGuiKey_Backspace, VK_BACK}, {ImGuiKey_Space, VK_SPACE}, {ImGuiKey_Enter, VK_RETURN},
+      {ImGuiKey_Escape, VK_ESCAPE}, {ImGuiKey_Tab, VK_TAB},
+      {ImGuiKey_Pause, VK_PAUSE}, {ImGuiKey_ScrollLock, VK_SCROLL}, {ImGuiKey_PrintScreen, VK_SNAPSHOT},
+      // Numpad
+      {ImGuiKey_Keypad0, VK_NUMPAD0}, {ImGuiKey_Keypad1, VK_NUMPAD1}, {ImGuiKey_Keypad2, VK_NUMPAD2},
+      {ImGuiKey_Keypad3, VK_NUMPAD3}, {ImGuiKey_Keypad4, VK_NUMPAD4}, {ImGuiKey_Keypad5, VK_NUMPAD5},
+      {ImGuiKey_Keypad6, VK_NUMPAD6}, {ImGuiKey_Keypad7, VK_NUMPAD7}, {ImGuiKey_Keypad8, VK_NUMPAD8},
+      {ImGuiKey_Keypad9, VK_NUMPAD9}, {ImGuiKey_KeypadDecimal, VK_DECIMAL},
+      {ImGuiKey_KeypadDivide, VK_DIVIDE}, {ImGuiKey_KeypadMultiply, VK_MULTIPLY},
+      {ImGuiKey_KeypadSubtract, VK_SUBTRACT}, {ImGuiKey_KeypadAdd, VK_ADD}, {ImGuiKey_KeypadEnter, VK_RETURN},
+      // Letters
+      {ImGuiKey_A, 'A'}, {ImGuiKey_B, 'B'}, {ImGuiKey_C, 'C'}, {ImGuiKey_D, 'D'}, {ImGuiKey_E, 'E'},
+      {ImGuiKey_F, 'F'}, {ImGuiKey_G, 'G'}, {ImGuiKey_H, 'H'}, {ImGuiKey_I, 'I'}, {ImGuiKey_J, 'J'},
+      {ImGuiKey_K, 'K'}, {ImGuiKey_L, 'L'}, {ImGuiKey_M, 'M'}, {ImGuiKey_N, 'N'}, {ImGuiKey_O, 'O'},
+      {ImGuiKey_P, 'P'}, {ImGuiKey_Q, 'Q'}, {ImGuiKey_R, 'R'}, {ImGuiKey_S, 'S'}, {ImGuiKey_T, 'T'},
+      {ImGuiKey_U, 'U'}, {ImGuiKey_V, 'V'}, {ImGuiKey_W, 'W'}, {ImGuiKey_X, 'X'}, {ImGuiKey_Y, 'Y'}, {ImGuiKey_Z, 'Z'},
+      // Numbers
+      {ImGuiKey_0, '0'}, {ImGuiKey_1, '1'}, {ImGuiKey_2, '2'}, {ImGuiKey_3, '3'}, {ImGuiKey_4, '4'},
+      {ImGuiKey_5, '5'}, {ImGuiKey_6, '6'}, {ImGuiKey_7, '7'}, {ImGuiKey_8, '8'}, {ImGuiKey_9, '9'},
+      // Punctuation
+      {ImGuiKey_GraveAccent, VK_OEM_3}, {ImGuiKey_Minus, VK_OEM_MINUS}, {ImGuiKey_Equal, VK_OEM_PLUS},
+      {ImGuiKey_LeftBracket, VK_OEM_4}, {ImGuiKey_RightBracket, VK_OEM_6}, {ImGuiKey_Backslash, VK_OEM_5},
+      {ImGuiKey_Semicolon, VK_OEM_1}, {ImGuiKey_Apostrophe, VK_OEM_7},
+      {ImGuiKey_Comma, VK_OEM_COMMA}, {ImGuiKey_Period, VK_OEM_PERIOD}, {ImGuiKey_Slash, VK_OEM_2},
+  });
+
+  for (const auto& mapping : KEY_MAPPINGS) {
+    if (ImGui::IsKeyPressed(mapping.imgui_key, false)) {
+      return mapping.vk_code;
+    }
+  }
+  return 0;
+}
+
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "SettingsMode",
@@ -38,6 +120,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Settings Mode",
         .labels = {"Simple", "Intermediate", "Advanced"},
         .is_global = true,
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapType",
@@ -48,7 +131,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "RenoDRT"},
+        .labels = {"Vanilla", "Psycho V17"},
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
@@ -89,7 +172,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Scene Gamma Correction",
         .section = "Tone Mapping",
-        .labels = {"Off", "Gamma 2.2 By Luminance with Per Channel Chromiance"},
+        .labels = {"Off", "2.2 By Luminance with Per Channel Chrominance"},
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
@@ -99,16 +182,29 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "UI Gamma Correction",
         .section = "Tone Mapping",
-        .labels = {"Off", "Gamma 2.2 By Luminance with Per Channel Chromiance"},
+        .labels = {"Off", "2.2 By Luminance with Per Channel Chrominance"},
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
-        .key = "ToneMapHueCorrection",
-        .binding = &shader_injection.tone_map_hue_correction,
-        .default_value = 100.f,
+        .key = "ToneMapHueShift",
+        .binding = &shader_injection.tone_map_hue_shift,
+        .default_value = 200.f,
+        .label = "Hue Shift",
+        .section = "Tone Mapping",
+        .tooltip = "Hue shift emulation strength.",
+        .min = 0.f,
+        .max = 200.f,
+        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
+        .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return false; },
+    },
+    new renodx::utils::settings::Setting{
+        .key = "HueCorrection",
+        .binding = &shader_injection.hue_correction,
+        .default_value = 10.f,
         .label = "Hue Correction",
         .section = "Tone Mapping",
-        .tooltip = "Hue retention strength.",
+        .tooltip = "Post tonemap hue correction toward per channel reference. Fixes pink fire/lava.",
         .min = 0.f,
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
@@ -116,27 +212,28 @@ renodx::utils::settings::Settings settings = {
         .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
-        .key = "ToneMapHueShift",
-        .binding = &shader_injection.tone_map_hue_shift,
-        .default_value = 100.f,
-        .label = "Hue Shift",
+        .key = "LavaHueCorrection",
+        .binding = &shader_injection.lava_hue_correction,
+        .default_value = 0.f,
+        .label = "Fire/Lava Hue Shift",
         .section = "Tone Mapping",
-        .tooltip = "Hue-shift emulation strength.",
+        .tooltip = "Corrects pink lava/fire emissives toward warm orange.",
         .min = 0.f,
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
-        .key = "ToneMapPerChannelBlowout",
-        .binding = &shader_injection.tone_map_blowout,
-        .default_value = 100.f,
-        .label = "Purity Blowout",
+        .key = "LavaSaturation",
+        .binding = &shader_injection.lava_saturation,
+        .default_value = 50.f,
+        .label = "Fire/Lava Saturation",
         .section = "Tone Mapping",
+        .tooltip = "Controls saturation of lava/fire emissive surfaces.",
         .min = 0.f,
         .max = 100.f,
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .parse = [](float value) { return value * 0.01f; },
+        .parse = [](float value) { return value * 0.02f; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeExposure",
@@ -155,7 +252,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Highlights",
         .section = "Color Grading",
         .max = 100.f,
-        .parse = [](float value) { return value * 0.02f; },
+        .parse = [](float value) { return (value + 2.f) * 0.02f; },
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
@@ -189,14 +286,14 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "ColorGradeHighlightSaturation",
         .binding = &shader_injection.tone_map_highlight_saturation,
-        .default_value = 50.f,
+        .default_value = 80.f,
         .label = "Highlight Saturation",
         .section = "Color Grading",
         .tooltip = "Adds or removes highlight color.",
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value * 0.02f; },
-        .is_visible = []() { return current_settings_mode >= 1; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeBlowout",
@@ -206,7 +303,9 @@ renodx::utils::settings::Settings settings = {
         .section = "Color Grading",
         .tooltip = "Controls highlight desaturation due to overexposure.",
         .max = 100.f,
+        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value * 0.01f; },
+        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeFlare",
@@ -265,28 +364,14 @@ renodx::utils::settings::Settings settings = {
         .key = "BloomScaling",
         .binding = &shader_injection.bloom_scaling,
         .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 70.f,
+        .default_value = 60.f,
         .can_reset = true,
         .label = "Bloom Scaling",
         .section = "Effects",
-        .tooltip = "Controls bloom black-floor preservation. Higher values suppress bloom more in dark areas.",
+        .tooltip = "Controls bloom black floor preservation. Higher values suppress bloom more in dark areas.",
         .min = 0.f,
         .max = 100.f,
         .parse = [](float value) { return value * 0.01f; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "AOStrength",
-        .binding = &shader_injection.ao_strength,
-        .value_type = renodx::utils::settings::SettingValueType::FLOAT,
-        .default_value = 100.f,
-        .can_reset = true,
-        .label = "AO Strength",
-        .section = "Effects",
-        .tooltip = "Controls ambient occlusion intensity in deferred lighting. Lower values reduce black crush in dark areas.",
-        .min = 0.f,
-        .max = 100.f,
-        .parse = [](float value) { return value * 0.01f; },
-        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "HideUI",
@@ -299,66 +384,79 @@ renodx::utils::settings::Settings settings = {
         .labels = {"Off", "On"},
     },
     new renodx::utils::settings::Setting{
-        .key = "SwapChainEncoding",
-        .binding = &shader_injection.swap_chain_encoding,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 4.f,
-        .label = "Encoding",
-        .section = "Display Output",
-        .labels = {"None", "SRGB", "2.2", "2.4", "HDR10", "scRGB"},
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .on_change_value = [](float previous, float current) {
-          bool is_hdr10 = current == 4;
-          shader_injection.swap_chain_encoding_color_space = (is_hdr10 ? 1.f : 0.f);
+        .key = "UIToggleHotkey",
+        .value_type = renodx::utils::settings::SettingValueType::CUSTOM,
+        .default_value = 0.f,
+        .label = "Hide UI Hotkey",
+        .section = "Effects",
+        .tooltip = "Click in the field and press any key to set the hotkey, or press Backspace/Delete to clear",
+        .on_draw = []() {
+          static bool key_was_pressed = false;
+          bool changed = false;
+
+          // Get current key name for display
+          std::string key_name = ui_toggle_hotkey != 0 ? GetKeyName(ui_toggle_hotkey) : "";
+          char buf[64] = {0};
+          if (!key_name.empty()) {
+            size_t copy_len = (key_name.size() < sizeof(buf) - 1) ? key_name.size() : sizeof(buf) - 1;
+            memcpy(buf, key_name.c_str(), copy_len);
+          }
+
+          // Create the input text widget
+          ImGui::InputTextWithHint(
+              "Hide UI Hotkey",
+              "Click to set keyboard shortcut",
+              buf,
+              sizeof(buf),
+              ImGuiInputTextFlags_ReadOnly | ImGuiInputTextFlags_NoUndoRedo | ImGuiInputTextFlags_NoHorizontalScroll);
+
+          // Check if widget is active and capture key presses
+          if (ImGui::IsItemActive()) {
+            hotkey_input_active = true;
+            int key_pressed = GetLastKeyPressedImGui();
+
+            if (key_pressed != 0 && !key_was_pressed) {
+              if (key_pressed == VK_BACK || key_pressed == VK_DELETE) {
+                ui_toggle_hotkey = 0;
+                changed = true;
+              } else if (key_pressed != VK_ESCAPE) {
+                ui_toggle_hotkey = key_pressed;
+                changed = true;
+              }
+
+              if (changed) {
+                reshade::set_config_value(nullptr, renodx::utils::settings::global_name.c_str(), "UIToggleHotkey", ui_toggle_hotkey);
+              }
+
+              key_was_pressed = true;
+            } else if (key_pressed == 0) {
+              key_was_pressed = false;
+            }
+          } else {
+            hotkey_input_active = false;
+            key_was_pressed = false;
+          }
+
+          if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip)) {
+            ImGui::SetTooltip("Click and press any key to set hotkey.\nPress Backspace or Delete to clear.");
+          }
+
+          return changed;
         },
         .is_global = true,
-        .is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
-        .key = "IntermediateDecoding",
-        .binding = &shader_injection.intermediate_encoding,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "Intermediate Encoding",
-        .section = "Display Output",
-        .labels = {"Auto", "None", "SRGB", "2.2", "2.4"},
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .parse = [](float value) {
-            if (value == 0) return shader_injection.gamma_correction + 1.f;
-            return value - 1.f; },
-        .is_visible = []() { return false; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "SwapChainDecoding",
-        .binding = &shader_injection.swap_chain_decoding,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 0.f,
-        .label = "Swapchain Decoding",
-        .section = "Display Output",
-        .labels = {"Auto", "None", "SRGB", "2.2", "2.4"},
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .parse = [](float value) {
-            if (value == 0) return shader_injection.intermediate_encoding;
-            return value - 1.f; },
-        .is_visible = []() { return false; },
-    },
-    new renodx::utils::settings::Setting{
-        .key = "SwapChainClampColorSpace",
-        .binding = &shader_injection.swap_chain_clamp_color_space,
-        .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 2.f,
-        .label = "Clamp Color Space",
-        .section = "Display Output",
-        .labels = {"None", "BT709", "BT2020", "AP1"},
-        .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
-        .parse = [](float value) { return value - 1.f; },
-        .is_visible = []() { return false; },
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .label = "Reset All",
+        .section = "Options",
+        .group = "button-line-1",
+        .on_change = []() { renodx::utils::settings::ResetSettings(); },
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
         .label = "Discord",
         .section = "Links",
-        .group = "button-line-1",
+        .group = "button-line-2",
         .tint = 0x5865F2,
         .on_change = []() {
           renodx::utils::platform::LaunchURL("https://discord.gg/", "5WZXDpmbpP");
@@ -368,7 +466,7 @@ renodx::utils::settings::Settings settings = {
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
         .label = "More Mods",
         .section = "Links",
-        .group = "button-line-1",
+        .group = "button-line-2",
         .tint = 0x2B3137,
         .on_change = []() {
           renodx::utils::platform::LaunchURL("https://github.com/", "clshortfuse/renodx/wiki/Mods");
@@ -386,7 +484,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = std::string("- Many thanks to ShortFuse for RenoDX"),
+        .label = std::string("- Many thanks to ShortFuse for RenoDX & Ritsu for RenoVK"),
         .section = "About",
     },
     new renodx::utils::settings::Setting{
@@ -408,9 +506,9 @@ void OnPresetOff() {
   renodx::utils::settings::UpdateSetting("VignetteStrength", 100.f);
   renodx::utils::settings::UpdateSetting("BloomStrength", 100.f);
   renodx::utils::settings::UpdateSetting("BloomScaling", 0.f);
-  renodx::utils::settings::UpdateSetting("AOStrength", 100.f);
   renodx::utils::settings::UpdateSetting("GammaCorrection", 0.f);
   renodx::utils::settings::UpdateSetting("SwapChainGammaCorrection", 0.f);
+  renodx::utils::settings::UpdateSetting(  "HideUI", 0.f);
 }
 
 void OnInitDevice(reshade::api::device* device) {
@@ -418,6 +516,13 @@ void OnInitDevice(reshade::api::device* device) {
   const auto view_upgrades = renodx::utils::resource::VIEW_UPGRADES_RGBA16F;
 
   std::vector<renodx::utils::resource::ResourceUpgradeInfo> upgrade_infos = {
+      {
+          .old_format = reshade::api::format::r8g8b8a8_typeless,
+          .new_format = target_format,
+          .ignore_size = true,
+          .view_upgrades = view_upgrades,
+          .usage_include = reshade::api::resource_usage::render_target,
+      },
       {
           .old_format = reshade::api::format::r8g8b8a8_unorm_srgb,
           .new_format = target_format,
@@ -428,6 +533,28 @@ void OnInitDevice(reshade::api::device* device) {
   };
 
   renodx::utils::resource::upgrade::SetUpgradeInfos(device, upgrade_infos);
+}
+
+void OnPresent(reshade::api::command_queue* /*unused*/,
+               reshade::api::swapchain* /*unused*/,
+               const reshade::api::rect* /*unused*/,
+               const reshade::api::rect* /*unused*/,
+               uint32_t /*unused*/,
+               const reshade::api::rect* /*unused*/) {
+  // Check UI toggle hotkey (skip if user is currently setting a new hotkey)
+  if (ui_toggle_hotkey != 0 && !hotkey_input_active) {
+    bool key_down = (GetAsyncKeyState(ui_toggle_hotkey) & 0x8000) != 0;
+
+    if (key_down && !ui_toggle_key_was_pressed) {
+      // Toggle Hide UI
+      shader_injection.hide_ui = (shader_injection.hide_ui == 0.f) ? 1.f : 0.f;
+
+      // Update the setting value to keep UI in sync
+      renodx::utils::settings::UpdateSetting("HideUI", shader_injection.hide_ui);
+    }
+
+    ui_toggle_key_was_pressed = key_down;
+  }
 }
 
 }  // namespace
@@ -445,11 +572,21 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
 
       renodx::utils::resource::upgrade::Use(fdw_reason);
       reshade::register_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::register_event<reshade::addon_event::present>(OnPresent);
+
+      // Load UI toggle hotkey from saved config
+      {
+        int saved_hotkey = 0;
+        if (reshade::get_config_value(nullptr, renodx::utils::settings::global_name.c_str(), "UIToggleHotkey", saved_hotkey)) {
+          ui_toggle_hotkey = saved_hotkey;
+        }
+      }
 
       break;
     case DLL_PROCESS_DETACH:
       renodx::utils::resource::upgrade::Use(fdw_reason);
       reshade::unregister_event<reshade::addon_event::init_device>(OnInitDevice);
+      reshade::unregister_event<reshade::addon_event::present>(OnPresent);
       reshade::unregister_addon(h_module);
       break;
   }
