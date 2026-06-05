@@ -107,6 +107,7 @@ inline constexpr std::wstring_view DEVKIT_MCP_PIPE_PREFIX = L"renodx-devkit-mcp"
 
 std::atomic<reshade::api::device*> snapshot_device = nullptr;
 std::atomic<reshade::api::device*> snapshot_queued_device = nullptr;
+std::atomic<uint32_t> snapshot_submission_counter = 0u;  // incremented per execute_command_list during snapshot
 std::mutex devkit_mcp_start_mutex;
 bool devkit_mcp_start_failed = false;
 renodx::utils::mcp::Server devkit_mcp_server({
@@ -221,6 +222,9 @@ struct DrawDetails {
   } draw_method;
 
   std::chrono::time_point<std::chrono::system_clock> timestamp;
+  uint64_t cmd_list_handle = 0u;       // command list this draw was recorded on
+  uint32_t cmd_list_draw_index = 0u;   // intra-command-list ordering (recording order)
+  uint32_t submission_order = 0u;      // assigned at execute_command_list time (queue submission order)
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> srv_binds;
   std::map<std::pair<uint32_t, uint32_t>, ResourceViewDetails> uav_binds;
   std::map<std::pair<uint32_t, uint32_t>, reshade::api::buffer_range> constants;
@@ -312,6 +316,9 @@ struct __declspec(uuid("3224946b-5c5f-478a-8691-83fbb9f88f1b")) CommandListData 
   std::map<uint32_t, ResourceViewDetails> render_targets;
   std::optional<reshade::api::blend_desc> blend_desc = std::nullopt;
   std::optional<reshade::api::rasterizer_desc> rasterizer_desc = std::nullopt;
+
+  // Submission ordering (for Vulkan multi-threaded command buffer recording)
+  uint32_t draw_counter = 0u;  // incremented per draw within this command list
 
   // std::vector<PipelineBindDetails> pipeline_binds;
 };
@@ -494,6 +501,166 @@ std::optional<std::vector<ResourceBind>> GetResourceBindsForShaderDetails(
     return shader_details->resource_binds;
   }
 
+  if (device->get_api() == reshade::api::device_api::vulkan) {
+    struct SpirvVariable {
+      std::string type_id;
+      std::string storage_class;
+      std::optional<uint32_t> set = std::nullopt;
+      std::optional<uint32_t> binding = std::nullopt;
+    };
+
+    auto disassembly = std::get<std::string>(shader_details->disassembly);
+    auto source_lines = StringViewSplitAll(disassembly, '\n');
+    shader_details->resource_binds = std::vector<ResourceBind>();
+    std::map<std::string, std::string> pointer_pointee_ids;
+    std::map<std::string, std::string> sampled_image_type_ids;
+    std::map<std::string, uint32_t> image_sampled_operands;
+    std::map<std::string, std::string> type_block_decorations;
+    std::map<std::string, SpirvVariable> variables;
+    std::map<std::string, uint32_t> descriptor_sets;
+    std::map<std::string, uint32_t> descriptor_bindings;
+
+    auto next_token = [](std::string_view& text) -> std::string_view {
+      text = StringViewTrimStart(text);
+      if (text.empty()) return {};
+
+      const auto token_end = text.find_first_of("\t\n\v\f\r ");
+      if (token_end == std::string_view::npos) {
+        auto token = text;
+        text = {};
+        return token;
+      }
+
+      auto token = text.substr(0, token_end);
+      text.remove_prefix(token_end + 1u);
+      return token;
+    };
+
+    for (auto line : source_lines) {
+      if (const auto comment_pos = line.find(';'); comment_pos != std::string_view::npos) {
+        line = line.substr(0, comment_pos);
+      }
+
+      auto rest = line;
+      auto first_token = next_token(rest);
+      if (first_token.empty()) continue;
+
+      if (first_token == "OpDecorate") {
+        auto id = next_token(rest);
+        auto decoration = next_token(rest);
+        auto value_token = next_token(rest);
+        if (id.empty() || decoration.empty()) continue;
+
+        if (decoration == "DescriptorSet") {
+          uint32_t value = 0u;
+          FromStringView(value_token, value);
+          descriptor_sets[std::string(id)] = value;
+          continue;
+        }
+        if (decoration == "Binding") {
+          uint32_t value = 0u;
+          FromStringView(value_token, value);
+          descriptor_bindings[std::string(id)] = value;
+          continue;
+        }
+        if (decoration == "Block" || decoration == "BufferBlock") {
+          type_block_decorations[std::string(id)] = std::string(decoration);
+          continue;
+        }
+        continue;
+      }
+
+      auto equals_token = next_token(rest);
+      if (equals_token != "=") continue;
+
+      auto opcode = next_token(rest);
+      if (opcode == "OpVariable") {
+        auto type_id = next_token(rest);
+        auto storage_class = next_token(rest);
+        if (type_id.empty() || storage_class.empty()) continue;
+
+        variables[std::string(first_token)] = SpirvVariable{
+            .type_id = std::string(type_id),
+            .storage_class = std::string(storage_class),
+        };
+        continue;
+      }
+      if (opcode == "OpTypePointer") {
+        next_token(rest);  // storage class
+        auto pointee_id = next_token(rest);
+        if (pointee_id.empty()) continue;
+
+        pointer_pointee_ids[std::string(first_token)] = std::string(pointee_id);
+        continue;
+      }
+      if (opcode == "OpTypeSampledImage") {
+        auto image_type_id = next_token(rest);
+        if (image_type_id.empty()) continue;
+
+        sampled_image_type_ids[std::string(first_token)] = std::string(image_type_id);
+        continue;
+      }
+      if (opcode == "OpTypeImage") {
+        next_token(rest);  // sampled type
+        next_token(rest);  // dim
+        next_token(rest);  // depth
+        next_token(rest);  // arrayed
+        next_token(rest);  // ms
+        auto sampled = next_token(rest);
+        if (sampled.empty()) continue;
+
+        uint32_t value = 0u;
+        FromStringView(sampled, value);
+        image_sampled_operands[std::string(first_token)] = value;
+      }
+    }
+
+    for (auto& [id, variable] : variables) {
+      if (auto pair = descriptor_sets.find(id); pair != descriptor_sets.end()) {
+        variable.set = pair->second;
+      }
+      if (auto pair = descriptor_bindings.find(id); pair != descriptor_bindings.end()) {
+        variable.binding = pair->second;
+      }
+      if (!variable.set.has_value() || !variable.binding.has_value()) continue;
+
+      ResourceBind resource_bind = {};
+      resource_bind.slot = variable.binding.value();
+      resource_bind.space = variable.set.value();
+
+      if (variable.storage_class == "StorageBuffer") {
+        resource_bind.type = ResourceBind::BindType::UAV;
+      } else if (variable.storage_class == "Uniform") {
+        auto pointee_id = variable.type_id;
+        if (auto pair = pointer_pointee_ids.find(pointee_id); pair != pointer_pointee_ids.end()) {
+          pointee_id = pair->second;
+        }
+        const auto block_decoration_pair = type_block_decorations.find(pointee_id);
+        resource_bind.type = (block_decoration_pair != type_block_decorations.end() && block_decoration_pair->second == "BufferBlock")
+                                 ? ResourceBind::BindType::UAV
+                                 : ResourceBind::BindType::CBV;
+      } else if (variable.storage_class == "UniformConstant") {
+        auto pointee_id = variable.type_id;
+        if (auto pair = pointer_pointee_ids.find(pointee_id); pair != pointer_pointee_ids.end()) {
+          pointee_id = pair->second;
+        }
+        if (auto pair = sampled_image_type_ids.find(pointee_id); pair != sampled_image_type_ids.end()) {
+          pointee_id = pair->second;
+        }
+        const auto sampled_pair = image_sampled_operands.find(pointee_id);
+        resource_bind.type = (sampled_pair != image_sampled_operands.end() && sampled_pair->second == 2u)
+                                 ? ResourceBind::BindType::UAV
+                                 : ResourceBind::BindType::SRV;
+      } else {
+        continue;
+      }
+
+      shader_details->resource_binds->push_back(resource_bind);
+    }
+
+    return shader_details->resource_binds;
+  }
+
   // Read texture declarations from SM5 disassembly
   if (shader_details->program_version.has_value()) {
     shader_details->resource_binds = std::vector<ResourceBind>();
@@ -626,6 +793,27 @@ std::string GetEntryPointForShaderDetails(reshade::api::device* device, DeviceDa
 
   bool ok = ComputeDisassemblyForShaderDetails(device, data, shader_details);
   if (!ok) {
+    return shader_details->entrypoint;
+  }
+
+  if (device->get_api() == reshade::api::device_api::vulkan) {
+    auto disassembly = std::get<std::string>(shader_details->disassembly);
+    auto source_lines = StringViewSplitAll(disassembly, '\n');
+
+    for (auto line : source_lines) {
+      line = StringViewTrimStart(line);
+      if (!line.starts_with("OpEntryPoint")) continue;
+
+      const auto name_start = line.find('"');
+      if (name_start != std::string_view::npos) {
+        const auto name_end = line.find('"', name_start + 1u);
+        if (name_end == std::string_view::npos) break;
+        shader_details->entrypoint = line.substr(name_start + 1u, name_end - name_start - 1u);
+        return shader_details->entrypoint;
+      }
+    }
+
+    shader_details->entrypoint = "main";
     return shader_details->entrypoint;
   }
 
@@ -3056,10 +3244,10 @@ void OnPushDescriptors(
                                         ResourceViewDetails>& destination) {
     if (!populate_layout_data()) return;
 
-    auto layout_params = layout_data->params;
-    const auto& param = layout_params[layout_param];
-    uint32_t dx_register_index = 0;
-    uint32_t dx_register_space = 0;
+    const auto& param = layout_data->params[layout_param];
+    const bool is_vulkan = device->get_api() == reshade::api::device_api::vulkan;
+    uint32_t register_index = 0;
+    uint32_t register_space = 0;
     switch (param.type) {
       case reshade::api::pipeline_layout_param_type::descriptor_table: {
         if (param.descriptor_table.count != 1) {
@@ -3067,28 +3255,50 @@ void OnPushDescriptors(
           // add warning
           return;
         }
-        dx_register_index = param.descriptor_table.ranges[0].dx_register_index;
-        dx_register_space = param.descriptor_table.ranges[0].dx_register_space;
+        register_index = is_vulkan ? param.descriptor_table.ranges[0].binding : param.descriptor_table.ranges[0].dx_register_index;
+        register_space = is_vulkan ? layout_param : param.descriptor_table.ranges[0].dx_register_space;
         break;
       }
       case reshade::api::pipeline_layout_param_type::push_descriptors:
-        dx_register_index = param.push_descriptors.dx_register_index;
-        dx_register_space = param.push_descriptors.dx_register_space;
+        register_index = is_vulkan ? param.push_descriptors.binding : param.push_descriptors.dx_register_index;
+        register_space = is_vulkan ? layout_param : param.push_descriptors.dx_register_space;
         break;
       case reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges:
-        if (param.descriptor_table.count <= update.binding) {
+      case reshade::api::pipeline_layout_param_type::push_descriptors_with_static_samplers: {
+        const auto descriptor_table_count =
+            param.type == reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges
+                ? param.descriptor_table.count
+                : param.descriptor_table_with_static_samplers.count;
+        const auto* descriptor_table_ranges =
+            param.type == reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges
+                ? param.descriptor_table.ranges
+                : param.descriptor_table_with_static_samplers.ranges;
+        const reshade::api::descriptor_range* matching_range = nullptr;
+        if (is_vulkan) {
+          for (uint32_t range_index = 0; range_index < descriptor_table_count; ++range_index) {
+            if (descriptor_table_ranges[range_index].binding == update.binding) {
+              matching_range = &descriptor_table_ranges[range_index];
+              break;
+            }
+          }
+        } else if (update.binding < descriptor_table_count) {
+          matching_range = &descriptor_table_ranges[update.binding];
+        }
+        if (matching_range == nullptr) {
           reshade::log::message(reshade::log::level::error, "Push descriptor binding out of range.");
           return;
         }
-        dx_register_index = param.descriptor_table.ranges[update.binding].dx_register_index;
-        dx_register_space = param.descriptor_table.ranges[update.binding].dx_register_space;
+        register_index = is_vulkan ? matching_range->binding : matching_range->dx_register_index;
+        register_space = is_vulkan ? layout_param : matching_range->dx_register_space;
         break;
+      }
       default:
         reshade::log::message(reshade::log::level::error, "Not descriptor table.");
         return;
     }
 
-    auto slot = std::pair<uint32_t, uint32_t>(dx_register_index + update.binding + index, dx_register_space);
+    const uint32_t slot_offset = is_vulkan ? update.array_offset + index : update.binding + index;
+    auto slot = std::pair<uint32_t, uint32_t>(register_index + slot_offset, register_space);
 
     if (view.handle == 0u) {
       destination.erase(slot);
@@ -3137,8 +3347,8 @@ void OnPushDescriptors(
       }
       case reshade::api::descriptor_type::constant_buffer: {
         if (!populate_layout_data()) return;
-        auto layout_params = layout_data->params;
-        auto param = layout_params[layout_param];
+        const auto& param = layout_data->params[layout_param];
+        const bool is_vulkan = device->get_api() == reshade::api::device_api::vulkan;
         if (param.type == reshade::api::pipeline_layout_param_type::push_descriptors) {
           assert(param.push_descriptors.type == reshade::api::descriptor_type::constant_buffer);
 
@@ -3157,8 +3367,8 @@ void OnPushDescriptors(
               break;
 
             case reshade::api::device_api::vulkan:
-              pair_a = update.binding;
-              pair_b = update.array_offset + i;
+              pair_a = param.push_descriptors.binding + update.array_offset + i;
+              pair_b = layout_param;
               break;
             default:
               assert(false);
@@ -3166,9 +3376,33 @@ void OnPushDescriptors(
           auto buffer_range = static_cast<const reshade::api::buffer_range*>(update.descriptors)[i];
           auto slot = std::pair<uint32_t, uint32_t>(pair_a, pair_b);
           data->constants[slot] = buffer_range;
-        } else if (param.type == reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges) {
+        } else if (param.type == reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges
+                   || param.type == reshade::api::pipeline_layout_param_type::push_descriptors_with_static_samplers) {
           uint32_t pair_a = 0;
           uint32_t pair_b = 0;
+          const auto descriptor_table_count =
+              param.type == reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges
+                  ? param.descriptor_table.count
+                  : param.descriptor_table_with_static_samplers.count;
+          const auto* descriptor_table_ranges =
+              param.type == reshade::api::pipeline_layout_param_type::push_descriptors_with_ranges
+                  ? param.descriptor_table.ranges
+                  : param.descriptor_table_with_static_samplers.ranges;
+          const reshade::api::descriptor_range* matching_range = nullptr;
+          if (is_vulkan) {
+            for (uint32_t range_index = 0; range_index < descriptor_table_count; ++range_index) {
+              if (descriptor_table_ranges[range_index].binding == update.binding) {
+                matching_range = &descriptor_table_ranges[range_index];
+                break;
+              }
+            }
+          } else if (update.binding < descriptor_table_count) {
+            matching_range = &descriptor_table_ranges[update.binding];
+          }
+          if (matching_range == nullptr) {
+            reshade::log::message(reshade::log::level::error, "Push descriptor binding out of range.");
+            return;
+          }
 
           switch (device->get_api()) {
             case reshade::api::device_api::d3d9:
@@ -3181,10 +3415,8 @@ void OnPushDescriptors(
               break;
 
             case reshade::api::device_api::vulkan:
-              assert(param.descriptor_table.count > update.binding);
-              assert(param.descriptor_table.ranges[update.binding].binding == update.binding);
-              pair_a = update.binding;
-              pair_b = update.array_offset + i;
+              pair_a = matching_range->binding + update.array_offset + i;
+              pair_b = layout_param;
               break;
             default:
               assert(false);
@@ -3220,6 +3452,8 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
     DrawDetails draw_details = {};
     draw_details.timestamp = std::chrono::system_clock::now();
     draw_details.draw_method = draw_method;
+    draw_details.cmd_list_handle = reinterpret_cast<uint64_t>(cmd_list);
+    draw_details.cmd_list_draw_index = command_list_data->draw_counter++;
     draw_details.constants = command_list_data->constants;
     // draw_details.pipeline_binds = command_list_data->pipeline_binds;
     if (draw_method == DrawDetails::DrawMethods::DISPATCH) {
@@ -3260,6 +3494,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       return cached.is_empty;
     };
 
+    reshade::api::pipeline descriptor_pipeline = {0u};
     std::set<reshade::api::pipeline> added_pipelines;
     for (auto stage_state : state->stage_states) {
       if (draw_method == DrawDetails::DrawMethods::DISPATCH) {
@@ -3313,6 +3548,7 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
 
       if ((draw_method == DrawDetails::DrawMethods::DISPATCH && stage_state.stage == reshade::api::pipeline_stage::compute_shader)
           || (draw_details.draw_method != DrawDetails::DrawMethods::DISPATCH && stage_state.stage == reshade::api::pipeline_stage::pixel_shader)) {
+        descriptor_pipeline = stage_state.pipeline;
         if (shader_details == nullptr) {
           shader_details = device_data->GetShaderDetails(shader_hash);
         }
@@ -3330,8 +3566,8 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
       }
     }
 
-    if (state->last_pipeline != 0u) {
-      auto* pipeline_shader_details = renodx::utils::shader::GetPipelineShaderDetails(state->last_pipeline);
+    if (descriptor_pipeline != 0u) {
+      auto* pipeline_shader_details = renodx::utils::shader::GetPipelineShaderDetails(descriptor_pipeline);
       if (pipeline_shader_details != nullptr) {
         const auto* layout_data = renodx::utils::pipeline_layout::GetPipelineLayoutData(pipeline_shader_details->layout);
         if (layout_data != nullptr) {
@@ -3343,6 +3579,23 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
           const auto& bound_descriptor_tables = draw_method == DrawDetails::DrawMethods::DISPATCH
                                                     ? command_list_state->compute_descriptor_tables
                                                     : command_list_state->graphics_descriptor_tables;
+
+          // DIAGNOSTIC: Log descriptor table state for debugging set 3 visibility
+          {
+            std::stringstream s;
+            s << "[RenoDX DevKit] DIAG::DescriptorState("
+              << "bound_tables=" << bound_descriptor_tables.size()
+              << ", layout_match=" << (bound_pipeline_layout == pipeline_shader_details->layout ? "YES" : "NO")
+              << ", bound_layout=0x" << std::hex << bound_pipeline_layout.handle
+              << ", pipeline_layout=0x" << pipeline_shader_details->layout.handle << std::dec
+              << ", param_count=" << (layout_data ? layout_data->params.size() : 0u);
+            for (size_t ti = 0; ti < bound_descriptor_tables.size(); ++ti) {
+              s << ", table[" << ti << "]=0x" << std::hex << bound_descriptor_tables[ti].handle << std::dec;
+            }
+            s << ")";
+            reshade::log::message(reshade::log::level::info, s.str().c_str());
+          }
+
           if (bound_pipeline_layout == pipeline_shader_details->layout) {
             const bool has_reflected_resource_binds = draw_details.resource_binds.has_value() && !draw_details.resource_binds->empty();
             const auto& info = *layout_data;
@@ -3376,17 +3629,36 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                   continue;
               }
 
+              // DIAGNOSTIC: Log param resolution for set 3 debugging
+              if (static_cast<size_t>(param_index) >= 3u) {
+                std::stringstream s;
+                s << "[RenoDX DevKit] DIAG::ParamResolve(param_index=" << param_index
+                  << ", type=" << static_cast<int>(param.type)
+                  << ", table=0x" << std::hex << table.handle << std::dec
+                  << ", range_count=" << descriptor_table_count
+                  << ")";
+                for (uint32_t ri = 0; ri < descriptor_table_count && ri < 8u; ++ri) {
+                  s << " range[" << ri << "](binding=" << descriptor_table_ranges[ri].binding
+                    << ",type=" << static_cast<int>(descriptor_table_ranges[ri].type)
+                    << ",count=" << descriptor_table_ranges[ri].count
+                    << ",vis=0x" << std::hex << static_cast<uint32_t>(descriptor_table_ranges[ri].visibility) << std::dec
+                    << ")";
+                }
+                reshade::log::message(reshade::log::level::info, s.str().c_str());
+              }
+
               for (uint32_t j = 0; j < descriptor_table_count; ++j) {
                 const auto& range = descriptor_table_ranges[j];
 
-                // Skip empty and unbounded ranges
-                if (range.count == 0u || range.count == UINT32_MAX) continue;
+                // Skip empty ranges. Unbounded ranges can still be resolved from reflected shader binds.
+                if (range.count == 0u) continue;
 
                 switch (range.type) {
                   case reshade::api::descriptor_type::shader_resource_view:
                   case reshade::api::descriptor_type::sampler_with_resource_view:
                   case reshade::api::descriptor_type::buffer_shader_resource_view:
                   case reshade::api::descriptor_type::unordered_access_view:
+                  case reshade::api::descriptor_type::buffer_unordered_access_view:
                   case reshade::api::descriptor_type::constant_buffer:
                     break;
                   default:
@@ -3397,17 +3669,35 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                     && !renodx::utils::bitwise::HasFlag(range.visibility, reshade::api::shader_stage::compute)) {
                   continue;
                 }
-                if (!renodx::utils::bitwise::HasFlag(range.visibility, reshade::api::shader_stage::pixel)) {
+                if (draw_method != DrawDetails::DrawMethods::DISPATCH
+                    && !renodx::utils::bitwise::HasFlag(range.visibility, reshade::api::shader_stage::pixel)) {
                   continue;
                 }
 
                 uint32_t base_offset = 0;
                 reshade::api::descriptor_heap heap = {0};
                 device->get_descriptor_heap_offset(table, range.binding, 0, &heap, &base_offset);
+
+                // DIAGNOSTIC: Log heap resolution for param_index >= 3
+                if (static_cast<size_t>(param_index) >= 3u) {
+                  std::stringstream s;
+                  s << "[RenoDX DevKit] DIAG::HeapProbe(param=" << param_index
+                    << ", range_j=" << j
+                    << ", binding=" << range.binding
+                    << ", heap=0x" << std::hex << heap.handle << std::dec
+                    << ", offset=" << base_offset
+                    << ")";
+                  reshade::log::message(reshade::log::level::info, s.str().c_str());
+                }
+
                 const std::shared_lock descriptor_lock(descriptor_data->mutex);
                 auto heap_pair = descriptor_data->heaps.find(heap.handle);
                 if (heap_pair == descriptor_data->heaps.end()) {
                   // Unknown heap?
+                  if (static_cast<size_t>(param_index) >= 3u) {
+                    reshade::log::message(reshade::log::level::info,
+                        std::format("[RenoDX DevKit] DIAG::HeapNotFound(param={}, heap=0x{:x})", param_index, heap.handle).c_str());
+                  }
                   continue;
                 }
                 const auto& heap_data = heap_pair->second;
@@ -3415,12 +3705,15 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                   // Invalid location (may be oversized bind)
                   continue;
                 }
-                const auto descriptor_count =
-                    std::min<uint32_t>(range.count, static_cast<uint32_t>(heap_data.size() - base_offset));
+                const auto available_descriptor_count = static_cast<uint32_t>(heap_data.size() - base_offset);
+                const auto descriptor_count = range.count == UINT32_MAX
+                                                  ? available_descriptor_count
+                                                  : std::min<uint32_t>(range.count, available_descriptor_count);
                 if (descriptor_count == 0u) continue;
                 ResourceBind::BindType range_bind_type;
                 switch (range.type) {
                   case reshade::api::descriptor_type::unordered_access_view:
+                  case reshade::api::descriptor_type::buffer_unordered_access_view:
                     range_bind_type = ResourceBind::BindType::UAV;
                     break;
                   case reshade::api::descriptor_type::constant_buffer:
@@ -3441,14 +3734,17 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                   uint32_t index = 0u;
                 };
                 std::vector<CandidateDescriptorSlot> candidate_slots;
+                const bool is_vulkan = device->get_api() == reshade::api::device_api::vulkan;
+                const uint32_t range_slot = is_vulkan ? range.binding : range.dx_register_index;
+                const uint32_t range_space = is_vulkan ? param_index : range.dx_register_space;
                 if (has_reflected_resource_binds) {
                   candidate_slots.reserve(draw_details.resource_binds->size());
                   for (const auto& bind : *draw_details.resource_binds) {
                     if (bind.type != range_bind_type) continue;
-                    if (bind.space != range.dx_register_space) continue;
-                    if (bind.slot < range.dx_register_index) continue;
+                    if (bind.space != range_space) continue;
+                    if (bind.slot < range_slot) continue;
 
-                    const auto k = bind.slot - range.dx_register_index;
+                    const auto k = bind.slot - range_slot;
                     if (k >= descriptor_count) continue;
 
                     candidate_slots.push_back({
@@ -3457,14 +3753,17 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                         .index = k,
                     });
                   }
-                } else {
+                }
+                // Fallback: if reflection didn't produce candidates for this range (e.g., externally
+                // injected descriptor sets not present in the tracked shader bytecode), use brute-force.
+                if (candidate_slots.empty()) {
                   static const uint32_t SNAPSHOT_DESCRIPTOR_RANGE_FALLBACK_MAX = 256u;
                   const auto fallback_count = std::min<uint32_t>(descriptor_count, SNAPSHOT_DESCRIPTOR_RANGE_FALLBACK_MAX);
                   candidate_slots.reserve(fallback_count);
                   for (uint32_t k = 0; k < fallback_count; ++k) {
                     candidate_slots.push_back({
-                        .slot = range.dx_register_index + k,
-                        .space = range.dx_register_space,
+                        .slot = range_slot + k,
+                        .space = range_space,
                         .index = k,
                     });
                   }
@@ -3476,6 +3775,19 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                   const auto offset = base_offset + candidate.index;
                   const auto& descriptor = heap_data[offset];
                   const auto slot = std::pair<uint32_t, uint32_t>(candidate.slot, candidate.space);
+
+                  // DIAGNOSTIC: Log descriptor content for set 3
+                  if (static_cast<size_t>(param_index) >= 3u) {
+                    std::stringstream s;
+                    s << "[RenoDX DevKit] DIAG::DescriptorContent(param=" << param_index
+                      << ", slot=(" << candidate.slot << "," << candidate.space << ")"
+                      << ", heap_offset=" << offset
+                      << ", desc_type=" << static_cast<int>(descriptor.type)
+                      << ", has_rv=" << descriptor.HasResourceView()
+                      << ", rv=0x" << std::hex << descriptor.resource_view.handle << std::dec
+                      << ")";
+                    reshade::log::message(reshade::log::level::info, s.str().c_str());
+                  }
 
                   if (range_bind_type == ResourceBind::BindType::CBV) {
                     if (descriptor.type != reshade::api::descriptor_type::constant_buffer
@@ -3513,6 +3825,59 @@ bool OnDraw(reshade::api::command_list* cmd_list, DrawDetails::DrawMethods draw_
                     draw_details.uav_binds.erase(slot);
                   } else {
                     draw_details.srv_binds.erase(slot);
+                  }
+                }
+              }
+            }
+          }
+          // Fallback: resolve descriptor tables bound at param indices that were skipped by the
+          // main loop (push_constants, push_descriptors types). This handles externally-injected
+          // descriptor sets (e.g., from .asi mods that patch pipeline layouts below ReShade's
+          // Vulkan layer, making the extra sets invisible to the addon's layout tracking).
+          // Also covers tables bound beyond the tracked param_count.
+          if (device->get_api() == reshade::api::device_api::vulkan) {
+            auto* descriptor_data_fallback = renodx::utils::data::Get<renodx::utils::descriptor::DeviceData>(device);
+            if (descriptor_data_fallback != nullptr) {
+              const auto tracked_param_count = layout_data != nullptr ? layout_data->params.size() : 0u;
+              const auto bound_table_count = bound_descriptor_tables.size();
+              for (size_t extra_index = 0; extra_index < bound_table_count; ++extra_index) {
+                const auto& table = bound_descriptor_tables[extra_index];
+                if (table.handle == 0u) continue;
+
+                // Skip indices already handled by the main loop (descriptor_table types)
+                if (extra_index < tracked_param_count) {
+                  const auto& param = layout_data->params.at(extra_index);
+                  if (param.type == reshade::api::pipeline_layout_param_type::descriptor_table
+                      || param.type == reshade::api::pipeline_layout_param_type::descriptor_table_with_static_samplers) {
+                    continue;  // Already resolved above
+                  }
+                }
+
+                // This table was either skipped (push_constants at this index) or is beyond
+                // the tracked layout. Probe its bindings via the descriptor heap.
+                static constexpr uint32_t MAX_PROBE_BINDINGS = 32u;
+                for (uint32_t binding = 0; binding < MAX_PROBE_BINDINGS; ++binding) {
+                  uint32_t base_offset = 0;
+                  reshade::api::descriptor_heap heap = {0};
+                  device->get_descriptor_heap_offset(table, binding, 0, &heap, &base_offset);
+                  if (heap.handle == 0u) break;  // No more valid bindings
+
+                  const std::shared_lock descriptor_lock(descriptor_data_fallback->mutex);
+                  auto heap_pair = descriptor_data_fallback->heaps.find(heap.handle);
+                  if (heap_pair == descriptor_data_fallback->heaps.end()) break;
+                  const auto& heap_data = heap_pair->second;
+                  if (base_offset >= heap_data.size()) continue;
+
+                  const auto& descriptor = heap_data[base_offset];
+                  if (!descriptor.HasResourceView()) continue;
+
+                  const auto resource_view = descriptor.resource_view;
+                  if (resource_view.handle == 0u) continue;
+
+                  auto slot = std::pair<uint32_t, uint32_t>(binding, static_cast<uint32_t>(extra_index));
+                  auto& cached = get_cached_resource_view_details(resource_view);
+                  if (cached.details.resource.handle != 0u || !is_cached_resource_view_empty(cached, resource_view)) {
+                    draw_details.srv_binds[slot] = cached.details;
                   }
                 }
               }
@@ -4966,10 +5331,17 @@ void RenderCapturePane(reshade::api::device* device, DeviceData* data) {
             const auto& slot = slot_space.first;
             const auto& space = slot_space.second;
             if (snapshot_pane_filter_resources_by_shader_use && draw_details.resource_binds.has_value()) {
-              if (std::ranges::none_of(*draw_details.resource_binds, [&slot, &space](const ResourceBind& bind) {
-                    return bind.type == ResourceBind::BindType::SRV && bind.slot == slot && bind.space == space;
-                  })) {
-                continue;
+              // Only filter if the reflection covers this space (has any bind in this space).
+              // Bindings from externally-injected sets (not in reflection) are always shown.
+              const bool reflection_covers_space = std::ranges::any_of(*draw_details.resource_binds, [&space](const ResourceBind& bind) {
+                return bind.space == space;
+              });
+              if (reflection_covers_space) {
+                if (std::ranges::none_of(*draw_details.resource_binds, [&slot, &space](const ResourceBind& bind) {
+                      return bind.type == ResourceBind::BindType::SRV && bind.slot == slot && bind.space == space;
+                    })) {
+                  continue;
+                }
               }
             }
 
@@ -7196,6 +7568,28 @@ void OnRegisterOverlay(reshade::api::effect_runtime* runtime) {
   ImGui::EndChild();
 }
 
+void OnExecuteCommandList(
+    reshade::api::command_queue* queue,
+    reshade::api::command_list* cmd_list) {
+  if (snapshot_device == nullptr) return;
+  auto* device = cmd_list->get_device();
+  if (device != snapshot_device) return;
+
+  // Assign submission order to all draws recorded on this command list.
+  const uint32_t order = snapshot_submission_counter.fetch_add(1u, std::memory_order_relaxed);
+  const uint64_t cmd_handle = reinterpret_cast<uint64_t>(cmd_list);
+
+  auto* device_data = renodx::utils::data::Get<DeviceData>(device);
+  if (device_data == nullptr) return;
+
+  std::unique_lock lock(device_data->mutex);
+  for (auto& draw : device_data->draw_details_list) {
+    if (draw.cmd_list_handle == cmd_handle && draw.submission_order == 0u) {
+      draw.submission_order = order + 1u;  // +1 so 0 means "not yet submitted"
+    }
+  }
+}
+
 void OnPresent(
     reshade::api::command_queue* queue,
     reshade::api::swapchain* swapchain,
@@ -7307,6 +7701,7 @@ void OnPresent(
       device_data->snapshot_rows.clear();
       device_data->snapshot_row_layout_key = 0u;
       device_data->snapshot_rows_valid = false;
+      snapshot_submission_counter.store(0u, std::memory_order_relaxed);
       snapshot_device = device;
       snapshot_queued_device = nullptr;
     }
@@ -7315,6 +7710,11 @@ void OnPresent(
     auto* device_data = get_data();
     std::unique_lock lock(device_data->mutex);
     std::ranges::sort(device_data->draw_details_list, [](const DrawDetails& a, const DrawDetails& b) {
+      // Primary sort: queue submission order (execute_command_list sequence)
+      if (a.submission_order != b.submission_order) return a.submission_order < b.submission_order;
+      // Secondary sort: intra-command-list recording order
+      if (a.cmd_list_handle == b.cmd_list_handle) return a.cmd_list_draw_index < b.cmd_list_draw_index;
+      // Fallback: timestamp
       return a.timestamp < b.timestamp;
     });
 
@@ -7404,6 +7804,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::register_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       reshade::register_event<reshade::addon_event::dispatch>(OnDispatch);
       reshade::register_event<reshade::addon_event::present>(OnPresent);
+      reshade::register_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
       reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
@@ -7440,6 +7841,7 @@ BOOL APIENTRY DllMain(HMODULE h_module, DWORD fdw_reason, LPVOID lpv_reserved) {
       reshade::unregister_event<reshade::addon_event::draw_or_dispatch_indirect>(OnDrawOrDispatchIndirect);
       reshade::unregister_event<reshade::addon_event::dispatch>(OnDispatch);
       reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+      reshade::unregister_event<reshade::addon_event::execute_command_list>(OnExecuteCommandList);
       reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
       reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
       reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);

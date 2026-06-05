@@ -1,5 +1,5 @@
 #include "./shared.h"
-#include "../../shaders/color/macleod_boynton.hlsl"
+#include "./macleod_boynton_purity.hlsl"
 #include "./psycho_test11.hlsl"
 
 struct UserGradingConfig {

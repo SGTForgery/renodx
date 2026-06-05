@@ -116,7 +116,7 @@ renodx::utils::settings::Settings settings = {
         .label = "Highlights",
         .section = "Color Grading",
         .max = 100.f,
-        .parse = [](float value) { return value * 0.02f; },
+        .parse = [](float value) { return (value - 1.f) * 0.02f; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeShadows",
@@ -214,17 +214,6 @@ renodx::utils::settings::Settings settings = {
             .parse = [](float value) { return value * 0.01f; },
         }),
     new renodx::utils::settings::Setting({
-            .key = "RenderingMultiScatter",
-            .binding = &shader_injection.rendering_multi_scatter,
-            .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
-            .default_value = 0.f,
-            .label = "Multi-Scatter GGX",
-            .section = "Rendering",
-            .tooltip = "Adds Kulla-Conty energy compensation to specular GGX. Recovers lost energy on rough metals.",
-            .labels = {"Off", "On"},
-            .is_visible = []() { return false; },
-        }),
-    new renodx::utils::settings::Setting({
             .key = "RenderingCubemapMod",
             .binding = &shader_injection.rendering_cubemap_mod,
             .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
@@ -247,12 +236,13 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting({
             .key = "RenderingShadowImprovements",
             .binding = &shader_injection.rendering_shadow_improvements,
-            .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
+            .value_type = renodx::utils::settings::SettingValueType::INTEGER,
             .default_value = 1.f,
-            .label = "Shadow Improvements",
+            .label = "Shadow Bias Mode",
             .section = "Rendering",
-            .tooltip = "Applies CSM shadow data to ambient/indirect lighting in areas where the engine skips it (e.g. Grymforge).",
-            .labels = {"Off", "On"},
+            .tooltip = "Controls CSM shadow resolve bias. 0=Vanilla (derivative normals, per-cascade scaling, material-type inversion). 1=Hybrid Oriented Bias (GBuffer normals, vanilla magnitudes, no material-type-4 inversion — fixes acne on large meshes). 2=Disable CSM. 3=Zero Bias diagnostic. 4=Max Taps diagnostic.",
+            .labels = {"Vanilla", "Oriented Bias", "CSM Off", "Zero Bias", "Max Taps"},
+            .max = 4.f,
         }),
     new renodx::utils::settings::Setting({
             .key = "RenderingMicroShadows",
@@ -345,15 +335,16 @@ renodx::utils::settings::Settings settings = {
             .parse = [](float value) { return value * 0.01f; },
         }),
     new renodx::utils::settings::Setting({
-            .key = "CSMDebug",
-            .binding = &shader_injection.csm_debug,
-            .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+            .key = "RenderingIsFastNoise",
+            .binding = &shader_injection.rendering_isfast_noise,
+            .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,
             .default_value = 0.f,
-            .label = "CSM Debug View",
+            .label = "IS-FAST Shadow Noise",
             .section = "Rendering",
-            .tooltip = "0=Off, 1=Cascade, 2=SkipPCSS, 3=StableNrm, 4=Both, 5=GBufNrm, 6=DerivNrm, 7=RawGBufXY",
-            .max = 7.f,
+            .tooltip = "Replaces engine dither patterns with EA's Importance-Sampled FAST noise (128x128x32) for shadow sampling and stochastic alpha. Eliminates grid-aligned banding and converges smoothly under TAA.",
+            .labels = {"Bayer (Vanilla)", "IS-FAST"},
         }),
+
     new renodx::utils::settings::Setting({
             .key = "RenderingMicroShadowsDebug",
             .binding = &shader_injection.rendering_micro_shadows_debug,
@@ -470,7 +461,6 @@ void OnPresetOff() {
       {"CustomCurve", 50.f},
       {"HueCorrection", 0.f},
       {"FxGrainStrength", 0.f},
-      {"RenderingMultiScatter", 0.f},
       {"RenderingCubemapMod", 0.f},
       {"RenderingAODirect", 0.f},
       {"RenderingShadowImprovements", 0.f},
@@ -484,7 +474,8 @@ void OnPresetOff() {
       {"RenderingGBufferImprovements", 0.f},
       {"RenderingFogHazeAA", 0.f},
       {"RenderingFogColorCorrection", 100.f},
-      {"CSMDebug", 0.f},
+      {"RenderingIsFastNoise", 0.f},
+
   });
 }
 

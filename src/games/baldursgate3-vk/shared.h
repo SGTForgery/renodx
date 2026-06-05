@@ -26,13 +26,11 @@ struct ShaderInjectData {
   float custom_random;
   float custom_grain_strength;
   float custom_bloom;
-  float rendering_multi_scatter;
   float rendering_cubemap_mod;
   float rendering_ao_direct;
   float rendering_shadow_improvements;
   float rendering_micro_shadows;
   float rendering_micro_shadows_debug;
-  float csm_debug;
   float rendering_specular_occlusion;
   float rendering_probe_ao;
   float rendering_horizon_occlusion;
@@ -41,6 +39,7 @@ struct ShaderInjectData {
   float rendering_gbuffer_improvements;
   float rendering_fog_haze_aa;
   float rendering_fog_color_correction;
+  float rendering_isfast_noise;
 };
 
 #ifndef __cplusplus
@@ -93,7 +92,6 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_CUSTOM_RANDOM                     shader_injection.custom_random
 #define RENODX_CUSTOM_GRAIN_STRENGTH             shader_injection.custom_grain_strength
 #define RENODX_CUSTOM_BLOOM                      shader_injection.custom_bloom
-#define RENODX_RENDERING_MULTI_SCATTER           shader_injection.rendering_multi_scatter
 #define RENODX_RENDERING_CUBEMAP_MOD             shader_injection.rendering_cubemap_mod
 #define RENODX_RENDERING_AO_DIRECT               shader_injection.rendering_ao_direct
 #define RENODX_RENDERING_SHADOW_IMPROVEMENTS     shader_injection.rendering_shadow_improvements

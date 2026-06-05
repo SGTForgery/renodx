@@ -349,21 +349,19 @@ layout(push_constant) uniform RenoDXPushConstants {
     float custom_random;                 // 68
     float custom_grain_strength;         // 72
     float custom_bloom;                  // 76
-    float rendering_multi_scatter;       // 80
     float rendering_cubemap_mod;         // 84
     float rendering_ao_direct;           // 88
     float rendering_shadow_improvements; // 92
     float rendering_micro_shadows;       // 96
     float rendering_micro_shadows_debug; // 100
-    float csm_debug;                     // 104
-    float rendering_specular_occlusion;  // 108
-    float rendering_probe_ao;            // 112
-    float rendering_horizon_occlusion;   // 116
-    float rendering_hammon_diffuse;      // 120
-    float hero_lighting;                 // 124
-    float rendering_gbuffer_improvements; // 128
-    float rendering_fog_haze_aa;         // 132
-    float rendering_fog_color_correction; // 136
+    float rendering_specular_occlusion;  // 104
+    float rendering_probe_ao;            // 108
+    float rendering_horizon_occlusion;   // 112
+    float rendering_hammon_diffuse;      // 116
+    float hero_lighting;                 // 120
+    float rendering_gbuffer_improvements; // 124
+    float rendering_fog_haze_aa;         // 128
+    float rendering_fog_color_correction; // 132
 } pc;
 
 void main()

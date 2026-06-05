@@ -389,31 +389,35 @@ static bool OnCreatePipelineLayout(
     // }
     const uint32_t vk_new_local_pc_count = vk_aligned_pc_count + shader_injection_size;
     const uint32_t vk_new_total_pc_count = aligned_dword_count + shader_injection_size;
-    // TODO(Ritsu): Revise the limit
-    constexpr uint32_t vk_max_pc_count = 64u;  // Vulkan PC ranges, but 64(256 bytes) is a common limit
+    constexpr uint32_t vk_max_pc_count = 64u;  // Vulkan maxPushConstantsSize / 4 (256 bytes is spec common limit)
 
     if (vk_new_total_pc_count > vk_max_pc_count) {
+      // Expansion would exceed maxPushConstantsSize (256 bytes).
+      // Since replacement shaders don't use the engine's original push constants,
+      // replace the range with just our injection data at offset 0.
       std::stringstream s;
       s << "mods::shader::OnCreatePipelineLayout((Vulkan)";
-      s << " shader injection oversized";
+      s << " shader injection would exceed maxPushConstantsSize";
       s << ", original count: " << dword_count;
-      s << ", new count: " << vk_new_total_pc_count;
-      s << ", local count: " << vk_aligned_pc_count << " => " << vk_new_local_pc_count;
+      s << ", would-be count: " << vk_new_total_pc_count;
+      s << ", falling back to replacement at offset 0 with count: " << shader_injection_size;
       s << ")";
-      reshade::log::message(reshade::log::level::info, s.str().c_str());
+      reshade::log::message(reshade::log::level::warning, s.str().c_str());
+      pc.push_constants.binding = 0;
+      pc.push_constants.count = shader_injection_size;
+    } else {
+      // TODO(Ritsu): If PC is in the middle, it'll interfere with later PCs offsets (rare)
+      pc.push_constants.count = vk_new_local_pc_count;
     }
-    // TODO(Ritsu): If PC is in the middle, it'll interfere with later PCs offsets (rare)
-    pc.push_constants.count = vk_new_local_pc_count;
     // pc.push_constants.visibility = utils::bitwise::SetFlag(pc.push_constants.visibility, pc_allowed_stages);
 
     std::stringstream s;
     s << "mods::shader::OnCreatePipelineLayout((Vulkan)";
     s << " at root_index " << vk_expand_pc_index;
     s << " with constants size " << aligned_dword_count;
-    s << " with offset " << vk_aligned_offset;
-    s << " creating new size of " << vk_new_total_pc_count;
-    s << ", aligned count: " << aligned_dword_count;
-    s << ", local count: " << vk_aligned_pc_count << " => " << vk_new_local_pc_count;
+    s << " with offset " << pc.push_constants.binding;
+    s << " creating new size of " << (pc.push_constants.binding + pc.push_constants.count);
+    s << ", final count: " << pc.push_constants.count;
     s << " )";
     reshade::log::message(reshade::log::level::info, s.str().c_str());
     return true;
