@@ -209,32 +209,25 @@ void frag_main()
     // RenoDX: ColorGradeScene controls post transform LUT strength
     _460 = float4(lerp(_424.xyz, _460.xyz, saturate(RENODX_COLOR_GRADE_STRENGTH)), _460.w);
 
-    // RenoDX: Apply user grading after LUTs, before tonemap
     if (RENODX_TONE_MAP_TYPE > 0.f) {
-        UserGradingConfig _pre_cg = CreateColorGradeConfig();
-        float _pre_y = renodx::color::y::from::BT709(_460.xyz);
-        _460.xyz = ApplyExposureContrastFlareHighlightsShadowsByLuminance(
-            _460.xyz, _pre_y, _pre_cg);
-    }
-
-    if (RENODX_TONE_MAP_TYPE > 0.f) {
-
+  
         float in_max = max(1.0f, max(_460.x, max(_460.y, _460.z)));
         float3 normalized = _460.xyz / in_max;
-        float3 graded_color = renodx::color::srgb::DecodeSafe(normalized) * in_max;
+        float3 linear_color = renodx::color::srgb::DecodeSafe(normalized) * in_max;
+
+        // User grading in linear space
+        UserGradingConfig _pre_cg = CreateColorGradeConfig();
+        float _pre_y = renodx::color::y::from::BT709(linear_color);
+        linear_color = ApplyExposureContrastFlareHighlightsShadowsByLuminance(
+            linear_color, _pre_y, _pre_cg);
 
         LUTSampleResult lut_result;
-        lut_result.graded = graded_color;
-        lut_result.y = renodx::color::y::from::BT709(graded_color);
-        lut_result.graded_ap1 = renodx::color::ap1::from::BT709(graded_color);
+        lut_result.graded = linear_color;
+        lut_result.y = renodx::color::y::from::BT709(linear_color);
+        lut_result.graded_ap1 = renodx::color::ap1::from::BT709(linear_color);
         lut_result.pre_lut_linear = _396;
 
-        float3 hdr_color;
-        if (RENODX_TONE_MAP_TYPE == 2.f) {
-            hdr_color = PSYCHOGRADE_V20(lut_result);
-        } else {
-            hdr_color = PSYCHOGRADE(lut_result);
-        }
+        float3 hdr_color = PSYCHOGRADE(lut_result);
 
         float out_max = max(1.0f, max(hdr_color.r, max(hdr_color.g, hdr_color.b)));
         hdr_color = renodx::color::srgb::EncodeSafe(hdr_color / out_max) * out_max;

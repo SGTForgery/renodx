@@ -15,7 +15,6 @@ struct ShaderInjectData {
   float tone_map_contrast;
   float tone_map_saturation;
   float tone_map_highlight_saturation;
-  float tone_map_blowout;
   float tone_map_dechroma;
   float tone_map_flare;
   float tone_map_hue_shift;
@@ -28,8 +27,6 @@ struct ShaderInjectData {
   float bloom_scaling;
   float hide_ui;
   float hue_correction;
-  float lava_hue_correction;
-  float lava_saturation;
 };
 
 #ifndef __cplusplus
@@ -74,7 +71,6 @@ cbuffer shader_injection : register(b13) {
 #define RENODX_TONE_MAP_CONTRAST               shader_injection.tone_map_contrast
 #define RENODX_TONE_MAP_SATURATION             shader_injection.tone_map_saturation
 #define RENODX_TONE_MAP_HIGHLIGHT_SATURATION   shader_injection.tone_map_highlight_saturation
-#define RENODX_TONE_MAP_BLOWOUT                shader_injection.tone_map_blowout
 #define RENODX_TONE_MAP_DECHROMA               shader_injection.tone_map_dechroma
 #define RENODX_TONE_MAP_FLARE                  shader_injection.tone_map_flare
 #define RENODX_COLOR_GRADE_STRENGTH            shader_injection.color_grade_strength
@@ -86,8 +82,6 @@ cbuffer shader_injection : register(b13) {
 #define BLOOM_STRENGTH                         shader_injection.bloom_strength
 #define BLOOM_SCALING                          shader_injection.bloom_scaling
 #define HUE_CORRECTION                         shader_injection.hue_correction
-#define LAVA_HUE_CORRECTION                    shader_injection.lava_hue_correction
-#define LAVA_SATURATION                        shader_injection.lava_saturation
 
 #include "../../shaders/renodx.hlsl"
 
