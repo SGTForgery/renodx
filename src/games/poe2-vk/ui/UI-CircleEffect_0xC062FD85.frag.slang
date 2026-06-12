@@ -1,7 +1,7 @@
 #include "../common.hlsl"
 
-[[vk::binding(0, 4)]]
-cbuffer type_ctime_cb : register(b0, space4)
+[[vk::binding(0, 9)]]
+cbuffer type_ctime_cb : register(b0, space9)
 {
     float ctime_cb_sdr_scale : packoffset(c0);
     float ctime_cb_clip_radius : packoffset(c0.y);
@@ -10,8 +10,8 @@ cbuffer type_ctime_cb : register(b0, space4)
 [[vk::binding(12, 0)]]
 SamplerState SamplerLinearWrapOffsetNoBias : register(s12, space0);
 
-[[vk::binding(20, 2)]]
-Texture2D<float4> tex : register(t20, space2);
+[[vk::binding(0, 5)]]
+Texture2D<float4> tex : register(t0, space5);
 
 static float2 in_var_TEXCOORD0;
 static float4 in_var_COLOR0;
@@ -38,6 +38,7 @@ void frag_main()
     float4 _59 = float4(_58.x, _58.y, _58.z, _52.w);
     bool4 _71 = (sqrt(pow(in_var_TEXCOORD0.x - 0.5f, 2.0f) + pow(in_var_TEXCOORD0.y - 0.5f, 2.0f)) > ctime_cb_clip_radius).xxxx;
     float4 _72 = float4(_71.x ? 0.0f.xxxx.x : _59.x, _71.y ? 0.0f.xxxx.y : _59.y, _71.z ? 0.0f.xxxx.z : _59.z, _71.w ? 0.0f.xxxx.w : _59.w);
+    // RenoDX: removed vanilla '* ctime_cb.sdr_scale' — ApplyUIProcessing handles HDR scaling
     out_var_SV_TARGET = ApplyUIProcessing(_72.xyz, _72.w);
 }
 

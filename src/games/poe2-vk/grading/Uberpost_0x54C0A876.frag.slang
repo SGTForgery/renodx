@@ -1,10 +1,12 @@
+// Only updated the register bindings and cbuffer defs. -nilly
+
 #include "../common.hlsl"
 #include "../poe2_rendering.hlsli"
 
 static float _193 = 0.0f;
 
-[[vk::binding(0, 4)]]
-cbuffer type_cpost_processing_desc_cb : register(b0, space4)
+[[vk::binding(0, 9)]]
+cbuffer type_cpost_processing_desc_cb : register(b0, space9)
 {
     int2 cpost_processing_desc_cb_screen_size : packoffset(c0);
     int2 cpost_processing_desc_cb_frame_size : packoffset(c0.z);
@@ -36,40 +38,41 @@ cbuffer type_cpost_processing_desc_cb : register(b0, space4)
     float cpost_processing_desc_cb_post_transform_ratio : packoffset(c23);
     float cpost_processing_desc_cb_exposure : packoffset(c23.y);
     uint cpost_processing_desc_cb_desaturation_enable : packoffset(c23.z);
-    uint cpost_processing_desc_cb_post_transform_enable : packoffset(c23.w);
-    float cpost_processing_desc_cb_hdr_scale : packoffset(c24);
-    int cpost_processing_desc_cb_oetf_id : packoffset(c24.y);
-    float cpost_processing_desc_cb_engine_loading_amount : packoffset(c24.z);
-    float cpost_processing_desc_cb_engine_loading_time : packoffset(c24.w);
-    float4 cpost_processing_desc_cb_azmeri_map_minmax : packoffset(c25);
-    uint cpost_processing_desc_cb_azmeri_enable : packoffset(c26);
-    uint cpost_processing_desc_cb_upscaled_color : packoffset(c26.y);
+    uint cpost_processing_desc_cb_vignette_enable : packoffset(c23.w);
+    uint cpost_processing_desc_cb_post_transform_enable : packoffset(c24);
+    float cpost_processing_desc_cb_hdr_scale : packoffset(c24.y);
+    int cpost_processing_desc_cb_oetf_id : packoffset(c24.z);
+    float cpost_processing_desc_cb_engine_loading_amount : packoffset(c24.w);
+    float cpost_processing_desc_cb_engine_loading_time : packoffset(c25);
+    float4 cpost_processing_desc_cb_azmeri_map_minmax : packoffset(c26);
+    uint cpost_processing_desc_cb_azmeri_enable : packoffset(c27);
+    uint cpost_processing_desc_cb_upscaled_color : packoffset(c27.y);
 };
 
 [[vk::binding(1, 0)]]
 SamplerState SamplerLinearClamp : register(s1, space0);
 [[vk::binding(9, 0)]]
 SamplerState SamplerLinearClampNoBias : register(s9, space0);
-[[vk::binding(17, 2)]]
-Texture2D<float4> source_sampler : register(t17, space2);
-[[vk::binding(18, 2)]]
-Texture2D<float4> depth_sampler : register(t18, space2);
-[[vk::binding(19, 2)]]
-Texture2D<float4> bloom_sampler : register(t19, space2);
-[[vk::binding(20, 2)]]
-Texture2D<float4> dof_foreground_sampler : register(t20, space2);
-[[vk::binding(21, 2)]]
-Texture2D<float4> dof_background_sampler : register(t21, space2);
-[[vk::binding(22, 2)]]
-Texture2D<float4> desaturation_sampler : register(t22, space2);
-[[vk::binding(23, 2)]]
-Texture2D<float4> gear_loading_tex : register(t23, space2);
-[[vk::binding(24, 2)]]
-Texture3D<float4> desaturation_transform_sampler : register(t24, space2);
-[[vk::binding(25, 2)]]
-Texture3D<float4> post_transform_sampler0 : register(t25, space2);
-[[vk::binding(26, 2)]]
-Texture3D<float4> post_transform_sampler1 : register(t26, space2);
+[[vk::binding(0, 5)]]
+Texture2D<float4> source_sampler : register(t0, space5);
+[[vk::binding(1, 5)]]
+Texture2D<float4> depth_sampler : register(t1, space5);
+[[vk::binding(2, 5)]]
+Texture2D<float4> bloom_sampler : register(t2, space5);
+[[vk::binding(3, 5)]]
+Texture2D<float4> dof_foreground_sampler : register(t3, space5);
+[[vk::binding(4, 5)]]
+Texture2D<float4> dof_background_sampler : register(t4, space5);
+[[vk::binding(5, 5)]]
+Texture2D<float4> desaturation_sampler : register(t5, space5);
+[[vk::binding(6, 5)]]
+Texture2D<float4> gear_loading_tex : register(t6, space5);
+[[vk::binding(7, 5)]]
+Texture3D<float4> desaturation_transform_sampler : register(t7, space5);
+[[vk::binding(8, 5)]]
+Texture3D<float4> post_transform_sampler0 : register(t8, space5);
+[[vk::binding(9, 5)]]
+Texture3D<float4> post_transform_sampler1 : register(t9, space5);
 
 static float4 gl_FragCoord;
 static float4 out_var_SV_TARGET;
@@ -167,14 +170,6 @@ void frag_main()
     float _380 = _200.x;
     float3 _sceneColor = _377.xyz * cpost_processing_desc_cb_original_intensity;
 
-    // RenoDX: Apply colour grading BEFORE bloom
-    if (RENODX_TONE_MAP_TYPE > 0.f) {
-        UserGradingConfig _pre_cg = CreateColorGradeConfig();
-        float _pre_y = renodx::color::y::from::BT709(_sceneColor);
-        _sceneColor = ApplyExposureContrastFlareHighlightsShadowsByLuminance(
-            _sceneColor, _pre_y, _pre_cg);
-    }
-
     float3 _bloomColor = bloom_sampler.SampleLevel(SamplerLinearClampNoBias, float4(_380, _200.y, 0.0f, 0.0f).xy, 0.0f).xyz;
 
     // Musa's bloom scaling
@@ -214,6 +209,14 @@ void frag_main()
     // RenoDX: ColorGradeScene controls post transform LUT strength
     _460 = float4(lerp(_424.xyz, _460.xyz, saturate(RENODX_COLOR_GRADE_STRENGTH)), _460.w);
 
+    // RenoDX: Apply user grading after LUTs, before tonemap
+    if (RENODX_TONE_MAP_TYPE > 0.f) {
+        UserGradingConfig _pre_cg = CreateColorGradeConfig();
+        float _pre_y = renodx::color::y::from::BT709(_460.xyz);
+        _460.xyz = ApplyExposureContrastFlareHighlightsShadowsByLuminance(
+            _460.xyz, _pre_y, _pre_cg);
+    }
+
     if (RENODX_TONE_MAP_TYPE > 0.f) {
 
         float in_max = max(1.0f, max(_460.x, max(_460.y, _460.z)));
@@ -227,7 +230,11 @@ void frag_main()
         lut_result.pre_lut_linear = _396;
 
         float3 hdr_color;
-        hdr_color = PSYCHOGRADE(lut_result);
+        if (RENODX_TONE_MAP_TYPE == 2.f) {
+            hdr_color = PSYCHOGRADE_V20(lut_result);
+        } else {
+            hdr_color = PSYCHOGRADE(lut_result);
+        }
 
         float out_max = max(1.0f, max(hdr_color.r, max(hdr_color.g, hdr_color.b)));
         hdr_color = renodx::color::srgb::EncodeSafe(hdr_color / out_max) * out_max;

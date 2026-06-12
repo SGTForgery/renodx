@@ -1,7 +1,7 @@
-#include "../common.hlsl"
+#include "../common.hlsl"						 
 
-[[vk::binding(0, 4)]]
-cbuffer type_ctime_cb : register(b0, space4)
+[[vk::binding(0, 9)]]					 
+cbuffer type_ctime_cb : register(b0, space9)
 {
     float ctime_cb_time : packoffset(c0);
     row_major float4x4 ctime_cb_transform : packoffset(c1);
@@ -24,22 +24,24 @@ cbuffer type_ctime_cb : register(b0, space4)
     float4 ctime_cb_shockwave_info[10] : packoffset(c16);
     uint ctime_cb_num_shockaves : packoffset(c26);
     float ctime_cb_distortion_intensity : packoffset(c26.y);
+    float ctime_cb_phase : packoffset(c26.z);
+    int ctime_cb_random : packoffset(c26.w);
 };
 
-[[vk::binding(12, 0)]]
+[[vk::binding(12, 0)]]					  
 SamplerState SamplerLinearWrapOffsetNoBias : register(s12, space0);
 
-[[vk::binding(13, 0)]]
+[[vk::binding(13, 0)]]					  
 SamplerState SamplerLinearClampOffsetNoBias : register(s13, space0);
 
-[[vk::binding(22, 2)]]
-Texture2D<float4> tex : register(t22, space2);
+[[vk::binding(0, 5)]]					  
+Texture2D<float4> tex : register(t0, space5);
 
-[[vk::binding(23, 2)]]
-Texture2D<float4> shine_map : register(t23, space2);
+[[vk::binding(1, 5)]]					  
+Texture2D<float4> shine_map : register(t1, space5);
 
-[[vk::binding(24, 2)]]
-Texture2D<float4> mask_tex : register(t24, space2);
+[[vk::binding(2, 5)]]					  
+Texture2D<float4> mask_tex : register(t2, space5);
 
 static float2 in_var_TEXCOORD0;
 static float4 in_var_COLOR0;

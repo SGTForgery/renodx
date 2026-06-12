@@ -1,7 +1,7 @@
 #include "../common.hlsl"
 
-[[vk::binding(0, 4)]]
-cbuffer type_ctime_cb : register(b0, space4)
+[[vk::binding(0, 9)]]
+cbuffer type_ctime_cb : register(b0, space9)
 {
     float ctime_cb_time : packoffset(c0);
     float ctime_cb_sdr_scale : packoffset(c0.y);
@@ -46,9 +46,8 @@ cbuffer type_ctime_cb : register(b0, space4)
 
 [[vk::binding(12, 0)]]
 SamplerState SamplerLinearWrapOffsetNoBias : register(s12, space0);
-
-[[vk::binding(20, 2)]]
-Texture2D<float4> tex : register(t20, space2);
+[[vk::binding(0, 5)]]
+Texture2D<float4> tex : register(t0, space5);
 
 static float2 in_var_TEXCOORD0;
 static float4 in_var_COLOR0;
@@ -71,8 +70,9 @@ void frag_main()
 {
     float4 _49 = in_var_COLOR0 * lerp(1.0f.xxxx, tex.Sample(SamplerLinearWrapOffsetNoBias, in_var_TEXCOORD0), in_var_TEXCOORD1.y.xxxx);
     float3 _50 = _49.xyz;
-    float3 _ui_color = lerp(dot(_50, float3(0.300000011920928955078125f, 0.589999973773956298828125f, 0.10999999940395355224609375f)).xxx, _50, in_var_TEXCOORD1.x.xxx).xyz;
-    out_var_SV_TARGET = ApplyUIProcessing(_ui_color, _49.w);
+    // RenoDX: removed vanilla '* ctime_cb_sdr_scale' — ApplyUIProcessing handles HDR scaling
+    float4 _color = float4(lerp(dot(_50, float3(0.300000011920928955078125f, 0.589999973773956298828125f, 0.10999999940395355224609375f)).xxx, _50, in_var_TEXCOORD1.x.xxx).xyz, _49.w);
+	out_var_SV_TARGET = ApplyUIProcessing(_color.xyz, _color.w);
 }
 
 SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)

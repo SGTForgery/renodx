@@ -6,6 +6,7 @@ struct InstanceData
     row_major float4x4 prev_world_transform;
     row_major float4x4 trail_emitter_transform;
     row_major float4x4 particle_emitter_transform;
+	float4 performance_overlay_data;								
     int4 dynamic_light_indices;
     float4 particle_emitter_pos;
     float4 dynamic_WindVector;
@@ -80,136 +81,139 @@ float2 getShadowOffset(int idx)
     }
 }
 
-[[vk::binding(0, 3)]]
-cbuffer type_cpass_cb : register(b0, space3)
+[[vk::binding(0, 9)]]
+cbuffer type_cpass_cb : register(b0, space9)
 {
     row_major float4x4 cpass_cb_breach_sphere_infos : packoffset(c0);
     row_major float4x4 cpass_cb_env_map_rotation : packoffset(c4);
-    row_major float4x4 cpass_cb_worldspace_view_proj : packoffset(c8);
-    row_major float4x4 cpass_cb_worldspace_view_proj_inv : packoffset(c12);
-    row_major float4x4 cpass_cb_last_view_projection_transform : packoffset(c16);
+    row_major float4x4 cpass_cb_last_view_projection_transform : packoffset(c8);
+    row_major float4x4 cpass_cb_scene_projection_transform : packoffset(c12);
+    row_major float4x4 cpass_cb_scene_projection_transform_inv : packoffset(c16);
     row_major float4x4 cpass_cb_scene_view_projection_transform : packoffset(c20);
     row_major float4x4 cpass_cb_scene_view_projection_transform_inv : packoffset(c24);
     row_major float4x4 cpass_cb_scene_view_projection_transform_nopost : packoffset(c28);
     row_major float4x4 cpass_cb_scene_view_transform : packoffset(c32);
     row_major float4x4 cpass_cb_scene_view_transform_inv : packoffset(c36);
-    row_major float4x4 cpass_cb_scene_projection_transform : packoffset(c40);
-    row_major float4x4 cpass_cb_scene_projection_transform_inv : packoffset(c44);
-    float4 cpass_cb_player_position : packoffset(c48);
-    float4 cpass_cb_specular_cube_size : packoffset(c49);
-    float4 cpass_cb_cube_brightness : packoffset(c50);
-    float4 cpass_cb_water_color_terrain : packoffset(c51);
-    float4 cpass_cb_water_color_open : packoffset(c52);
-    float4 cpass_cb_water_wind_direction : packoffset(c53);
-    float4 cpass_cb_ambient_light_color : packoffset(c54);
-    float4 cpass_cb_ambient_light_dir : packoffset(c55);
-    float4 cpass_cb_scene_planar_size : packoffset(c56);
+    row_major float4x4 cpass_cb_worldspace_view_proj : packoffset(c40);
+    row_major float4x4 cpass_cb_worldspace_view_proj_inv : packoffset(c44);
+    float4 cpass_cb_affliction_pos : packoffset(c48);
+    float4 cpass_cb_affliction_radii : packoffset(c49);
+    float4 cpass_cb_ambient_light_color : packoffset(c50);
+    float4 cpass_cb_ambient_light_dir : packoffset(c51);
+    float4 cpass_cb_azmeri_planar_minmax : packoffset(c52);
+    float4 cpass_cb_blight_tex_size : packoffset(c53);
+    float4 cpass_cb_clouds_velocity : packoffset(c54);
+    float4 cpass_cb_cube_brightness : packoffset(c55);
+    float4 cpass_cb_dust_color : packoffset(c56);
     float4 cpass_cb_flood_wave_size : packoffset(c57);
-    float4 cpass_cb_shoreline_coord_tex_size : packoffset(c58);
-    float4 cpass_cb_heightmap_world_size : packoffset(c59);
-    float4 cpass_cb_heightmap_tex_size : packoffset(c60);
-    float4 cpass_cb_walkability_tex_size : packoffset(c61);
-    float4 cpass_cb_blight_tex_size : packoffset(c62);
-    float4 cpass_cb_azmeri_planar_minmax : packoffset(c63);
-    float4 cpass_cb_affliction_pos : packoffset(c64);
-    float4 cpass_cb_affliction_radii : packoffset(c65);
-    float4 cpass_cb_infinite_hunger_arena_water_level : packoffset(c66);
-    float4 cpass_cb_frame_resolution : packoffset(c67);
-    float4 cpass_cb_frame_to_dynamic_scale : packoffset(c68);
-    float4 cpass_cb_rain_fall_dir : packoffset(c69);
-    float4 cpass_cb_clouds_velocity : packoffset(c70);
-    float4 cpass_cb_ground_scalemove_uv : packoffset(c71);
-    float4 cpass_cb_dust_color : packoffset(c72);
-    float4 cpass_cb_ssf_color : packoffset(c73);
-    float4 cpass_cb_fog_flowmap_tex_size : packoffset(c74);
-    float4 cpass_cb_fog_flowmap_world_size : packoffset(c75);
-    float4 cpass_cb_fog_flowmap_planar_aabb : packoffset(c76);
-    float4 cpass_cb_river_flowmap_planar_aabb : packoffset(c77);
-    float4 cpass_cb_shoreline_coord_planar_aabb : packoffset(c78);
-    int4 cpass_cb_volumetric_fx_grid_size : packoffset(c79);
-    float4 cpass_cb_frame_delta_time : packoffset(c80);
-    float3 cpass_cb_ground_speed : packoffset(c81);
-    uint cpass_cb_enable_mvec : packoffset(c81.w);
-    float3 cpass_cb_ssf_layercount_thickness_turbulence : packoffset(c82);
-    uint cpass_cb_scene_use_parabolic_projection : packoffset(c82.w);
-    int3 cpass_cb_volumetric_fx_grid_pos : packoffset(c83);
-    uint cpass_cb_use_double_sided : packoffset(c83.w);
-    int3 cpass_cb_volumetric_fx_grid_emit_pos : packoffset(c84);
-    uint cpass_cb_ssgi_detail : packoffset(c84.w);
+    float4 cpass_cb_fog_flowmap_planar_aabb : packoffset(c58);
+    float4 cpass_cb_fog_flowmap_tex_size : packoffset(c59);
+    float4 cpass_cb_fog_flowmap_world_size : packoffset(c60);
+    float4 cpass_cb_frame_delta_time : packoffset(c61);
+    float4 cpass_cb_frame_resolution : packoffset(c62);
+    float4 cpass_cb_frame_to_dynamic_scale : packoffset(c63);
+    float4 cpass_cb_ground_scalemove_uv : packoffset(c64);
+    float4 cpass_cb_guiding_fog_planar_aabb : packoffset(c65);
+    float4 cpass_cb_heightmap_tex_size : packoffset(c66);
+    float4 cpass_cb_heightmap_world_size : packoffset(c67);
+    float4 cpass_cb_infinite_hunger_arena_water_level : packoffset(c68);
+    float4 cpass_cb_player_position : packoffset(c69);
+    float4 cpass_cb_rain_fall_dir : packoffset(c70);
+    float4 cpass_cb_ritual_planar_minmax : packoffset(c71);
+    float4 cpass_cb_river_flowmap_planar_aabb : packoffset(c72);
+    float4 cpass_cb_scene_planar_size : packoffset(c73);
+    float4 cpass_cb_shoreline_coord_planar_aabb : packoffset(c74);
+    float4 cpass_cb_shoreline_coord_tex_size : packoffset(c75);
+    float4 cpass_cb_specular_cube_size : packoffset(c76);
+    float4 cpass_cb_ssf_color : packoffset(c77);
+    int4 cpass_cb_volumetric_fx_grid_size : packoffset(c78);
+    float4 cpass_cb_walkability_tex_size : packoffset(c79);
+    float4 cpass_cb_water_color_open : packoffset(c80);
+    float4 cpass_cb_water_color_terrain : packoffset(c81);
+    float4 cpass_cb_water_wind_direction : packoffset(c82);
+    float3 cpass_cb_ground_speed : packoffset(c83);
+    uint cpass_cb_water_use_downsampling : packoffset(c83.w);
+    float3 cpass_cb_scene_camera_forward_vector : packoffset(c84);
+    uint cpass_cb_water_debug : packoffset(c84.w);
     float3 cpass_cb_scene_camera_position : packoffset(c85);
-    uint cpass_cb_gi_self_lighting : packoffset(c85.w);
+    uint cpass_cb_use_double_sided : packoffset(c85.w);
     float3 cpass_cb_scene_camera_right_vector : packoffset(c86);
     uint cpass_cb_use_4x_scaling : packoffset(c86.w);
     float3 cpass_cb_scene_camera_up_vector : packoffset(c87);
-    uint cpass_cb_specular_cube_enabled : packoffset(c87.w);
-    float3 cpass_cb_scene_camera_forward_vector : packoffset(c88);
-    uint cpass_cb_diffuse_cube_enabled : packoffset(c88.w);
-    float2 cpass_cb_heightmap_world_pos : packoffset(c89);
-    uint cpass_cb_water_debug : packoffset(c89.z);
-    uint cpass_cb_water_use_downsampling : packoffset(c89.w);
-    int2 cpass_cb_burn_tex_size : packoffset(c90);
-    uint cpass_cb_emulated_platform : packoffset(c90.z);
-    float cpass_cb_debug_overlay_strength : packoffset(c90.w);
-    int2 cpass_cb_frame_size : packoffset(c91);
-    float cpass_cb_scene_depth_bias_scale : packoffset(c91.z);
-    float cpass_cb_indirect_light_multiplier : packoffset(c91.w);
-    int2 cpass_cb_dynamic_size : packoffset(c92);
+    uint cpass_cb_ssgi_detail : packoffset(c87.w);
+    float3 cpass_cb_ssf_layercount_thickness_turbulence : packoffset(c88);
+    uint cpass_cb_specular_cube_enabled : packoffset(c88.w);
+    int3 cpass_cb_volumetric_fx_grid_emit_pos : packoffset(c89);
+    uint cpass_cb_scene_use_parabolic_projection : packoffset(c89.w);
+    int3 cpass_cb_volumetric_fx_grid_pos : packoffset(c90);
+    uint cpass_cb_gi_self_lighting : packoffset(c90.w);
+    int2 cpass_cb_base_atlas_size : packoffset(c91);
+    uint cpass_cb_enable_mvec : packoffset(c91.z);
+    uint cpass_cb_diffuse_cube_enabled : packoffset(c91.w);
+    int2 cpass_cb_burn_tex_size : packoffset(c92);
     float cpass_cb_worldspace_units_per_pixel : packoffset(c92.z);
-    uint cpass_cb_frame_index : packoffset(c92.w);
+    float cpass_cb_world_map_zoom : packoffset(c92.w);
     int2 cpass_cb_downscaled_dynamic_size : packoffset(c93);
-    float cpass_cb_exposure : packoffset(c93.z);
-    float cpass_cb_ssgi_debug : packoffset(c93.w);
-    float2 cpass_cb_ssf_disperse_radius_feathering : packoffset(c94);
-    float cpass_cb_ssgi_intensity : packoffset(c94.z);
-    float cpass_cb_gi_env_occlusion : packoffset(c94.w);
-    int2 cpass_cb_sh_atlas_size : packoffset(c95);
-    int cpass_cb_base_probe_spacing : packoffset(c95.z);
-    int cpass_cb_sh_probe_spacing : packoffset(c95.w);
-    int2 cpass_cb_base_atlas_size : packoffset(c96);
-    float cpass_cb_direct_light_env_ratio : packoffset(c96.z);
-    float cpass_cb_tool_time : packoffset(c96.w);
+    float cpass_cb_water_wind_speed : packoffset(c93.z);
+    float cpass_cb_water_wind_intensity : packoffset(c93.w);
+    int2 cpass_cb_dynamic_size : packoffset(c94);
+    float cpass_cb_water_swell_period : packoffset(c94.z);
+    float cpass_cb_water_swell_intensity : packoffset(c94.w);
+    int2 cpass_cb_frame_size : packoffset(c95);
+    float cpass_cb_water_swell_height : packoffset(c95.z);
+    float cpass_cb_water_swell_angle : packoffset(c95.w);
+    float2 cpass_cb_heightmap_world_pos : packoffset(c96);
+    float cpass_cb_water_subsurface_scattering : packoffset(c96.z);
+    float cpass_cb_water_refraction_index : packoffset(c96.w);
     float2 cpass_cb_mouse_pos : packoffset(c97);
-    float cpass_cb_time : packoffset(c97.z);
-    int cpass_cb_pass_type : packoffset(c97.w);
-    float cpass_cb_water_subsurface_scattering : packoffset(c98);
-    int cpass_cb_pass_downscale : packoffset(c98.y);
-    float cpass_cb_clouds_post_fade : packoffset(c98.z);
-    float cpass_cb_clouds_pre_fade : packoffset(c98.w);
-    float cpass_cb_water_refraction_index : packoffset(c99);
-    float cpass_cb_clouds_fade_radius : packoffset(c99.y);
-    float cpass_cb_clouds_sharpness : packoffset(c99.z);
-    float cpass_cb_clouds_midpoint : packoffset(c99.w);
-    float cpass_cb_water_reflectiveness : packoffset(c100);
-    float cpass_cb_clouds_intensity : packoffset(c100.y);
-    float cpass_cb_clouds_scale : packoffset(c100.z);
-    float cpass_cb_rain_dist : packoffset(c100.w);
-    float cpass_cb_water_caustics_mult : packoffset(c101);
-    float cpass_cb_rain_amount : packoffset(c101.y);
-    float cpass_cb_rain_turbulence : packoffset(c101.z);
-    float cpass_cb_rain_intensity : packoffset(c101.w);
-    float cpass_cb_water_wind_intensity : packoffset(c102);
-    float cpass_cb_lake_mist_intensity : packoffset(c102.y);
-    float cpass_cb_depth_sampler_type : packoffset(c102.z);
-    float cpass_cb_flow_to_color : packoffset(c102.w);
-    float cpass_cb_water_wind_speed : packoffset(c103);
-    float cpass_cb_dist_to_color : packoffset(c103.y);
-    float cpass_cb_sum_longitude : packoffset(c103.z);
-    float cpass_cb_current_time : packoffset(c103.w);
-    float cpass_cb_water_directionness : packoffset(c104);
-    float cpass_cb_numerical_normal : packoffset(c104.y);
-    float cpass_cb_water_height_offset : packoffset(c104.z);
-    float cpass_cb_water_clarity : packoffset(c104.w);
-    float cpass_cb_water_swell_intensity : packoffset(c105);
-    float cpass_cb_water_dispersion : packoffset(c105.y);
-    float cpass_cb_water_flow_foam : packoffset(c105.z);
-    float cpass_cb_water_flow_intensity : packoffset(c105.w);
-    float cpass_cb_water_swell_height : packoffset(c106);
-    float cpass_cb_water_swell_period : packoffset(c106.y);
-    float cpass_cb_water_swell_angle : packoffset(c106.z);
+    float cpass_cb_water_reflectiveness : packoffset(c97.z);
+    float cpass_cb_water_height_offset : packoffset(c97.w);
+    int2 cpass_cb_sh_atlas_size : packoffset(c98);
+    float cpass_cb_water_flow_intensity : packoffset(c98.z);
+    float cpass_cb_water_flow_foam : packoffset(c98.w);
+    float2 cpass_cb_ssf_disperse_radius_feathering : packoffset(c99);
+    float cpass_cb_water_dispersion : packoffset(c99.z);
+    float cpass_cb_water_directionness : packoffset(c99.w);
+    int cpass_cb_base_probe_spacing : packoffset(c100);
+    float cpass_cb_water_clarity : packoffset(c100.y);
+    float cpass_cb_water_caustics_mult : packoffset(c100.z);
+    float cpass_cb_tool_time : packoffset(c100.w);
+    float cpass_cb_clouds_fade_radius : packoffset(c101);
+    float cpass_cb_time : packoffset(c101.y);
+    float cpass_cb_sum_longitude : packoffset(c101.z);
+    float cpass_cb_ssgi_intensity : packoffset(c101.w);
+    float cpass_cb_clouds_intensity : packoffset(c102);
+    float cpass_cb_ssgi_debug : packoffset(c102.y);
+    int cpass_cb_sh_probe_spacing : packoffset(c102.z);
+    float cpass_cb_scene_depth_bias_scale : packoffset(c102.w);
+    float cpass_cb_clouds_midpoint : packoffset(c103);
+    float cpass_cb_rain_turbulence : packoffset(c103.y);
+    float cpass_cb_rain_intensity : packoffset(c103.z);
+    float cpass_cb_rain_dist : packoffset(c103.w);
+    float cpass_cb_clouds_post_fade : packoffset(c104);
+    float cpass_cb_rain_amount : packoffset(c104.y);
+    int cpass_cb_pass_type : packoffset(c104.z);
+    int cpass_cb_pass_downscale : packoffset(c104.w);
+    float cpass_cb_clouds_pre_fade : packoffset(c105);
+    float cpass_cb_numerical_normal : packoffset(c105.y);
+    float cpass_cb_lake_mist_intensity : packoffset(c105.z);
+    float cpass_cb_indirect_light_multiplier : packoffset(c105.w);
+    float cpass_cb_clouds_scale : packoffset(c106);
+    float cpass_cb_gi_env_occlusion : packoffset(c106.y);
+    uint cpass_cb_frame_index : packoffset(c106.z);
+    float cpass_cb_flow_to_color : packoffset(c106.w);
+    float cpass_cb_clouds_sharpness : packoffset(c107);
+    float cpass_cb_exposure : packoffset(c107.y);
+    uint cpass_cb_emulated_platform : packoffset(c107.z);
+    float cpass_cb_dist_to_color : packoffset(c107.w);
+    float cpass_cb_current_time : packoffset(c108);
+    float cpass_cb_direct_light_env_ratio : packoffset(c108.y);
+    float cpass_cb_depth_sampler_type : packoffset(c108.z);
+    float cpass_cb_debug_overlay_strength : packoffset(c108.w);
 };
 
-[[vk::binding(0, 4)]]
-cbuffer type_cpipeline_cb : register(b0, space4)
+[[vk::binding(0, 10)]]
+cbuffer type_cpipeline_cb : register(b0, space10)
 {
     float4 cpipeline_cb_alpha_test_desc : packoffset(c0);
     float4 cpipeline_cb_constant4_2 : packoffset(c1);
@@ -235,8 +239,8 @@ cbuffer type_cpipeline_cb : register(b0, space4)
     uint cpipeline_cb_frame_material_id : packoffset(c11);
 };
 
-[[vk::binding(0, 5)]]
-cbuffer type_cobject_cb : register(b0, space5)
+[[vk::binding(0, 11)]]
+cbuffer type_cobject_cb : register(b0, space11)
 {
     uint cobject_cb_instance_count : packoffset(c0);
     uint cobject_cb_batch_size : packoffset(c0.y);
@@ -245,10 +249,10 @@ cbuffer type_cobject_cb : register(b0, space5)
     InstanceData cobject_cb_instances[16] : packoffset(c1);
 };
 
-[[vk::binding(27, 2)]]
-ByteAddressBuffer dynamic_light_infos : register(t27, space2);
-[[vk::binding(28, 2)]]
-ByteAddressBuffer point_light_data : register(t28, space2);
+[[vk::binding(10, 1)]]
+ByteAddressBuffer dynamic_light_infos : register(t10, space1);
+[[vk::binding(24, 1)]]
+ByteAddressBuffer point_light_data : register(t24, space1);
 [[vk::binding(0, 0)]]
 SamplerState SamplerLinearWrap : register(s0, space0);
 [[vk::binding(1, 0)]]
@@ -257,24 +261,24 @@ SamplerState SamplerLinearClamp : register(s1, space0);
 SamplerState SamplerLinearWrapNoBias : register(s8, space0);
 [[vk::binding(15, 0)]]
 SamplerComparisonState SamplerDepth : register(s15, space0);
-[[vk::binding(18, 2)]]
-TextureCube<float4> diffuse_cube : register(t18, space2);
-[[vk::binding(19, 2)]]
-TextureCube<float4> specular_cube : register(t19, space2);
-[[vk::binding(20, 2)]]
-Texture2D<float4> noise_sampler : register(t20, space2);
-[[vk::binding(21, 2)]]
-Texture2D<float4> tex_shadow_map_atlas : register(t21, space2);
-[[vk::binding(22, 2)]]
-Texture2D<float4> depth_sampler : register(t22, space2);
-[[vk::binding(23, 2)]]
-Texture2D<float4> texture_object_1 : register(t23, space2);
-[[vk::binding(24, 2)]]
-Texture2D<float4> texture_object_0 : register(t24, space2);
-[[vk::binding(25, 2)]]
-Texture2D<uint4> light_lookup : register(t25, space2);
-[[vk::binding(26, 2)]]
-Buffer<uint4> light_indices : register(t26, space2);
+[[vk::binding(7, 1)]]
+Texture2D<float4> depth_sampler : register(t7, space1);
+[[vk::binding(8, 1)]]
+TextureCube<float4> diffuse_cube : register(t8, space1);
+[[vk::binding(18, 1)]]
+Buffer<uint4> light_indices : register(t18, space1);
+[[vk::binding(19, 1)]]
+Texture2D<uint4> light_lookup : register(t19, space1);
+[[vk::binding(21, 1)]]
+Texture2D<float4> noise_sampler : register(t21, space1);
+[[vk::binding(31, 1)]]
+TextureCube<float4> specular_cube : register(t31, space1);
+[[vk::binding(34, 1)]]
+Texture2D<float4> tex_shadow_map_atlas : register(t34, space1);
+[[vk::binding(41, 2)]]
+Texture2D<float4> texture_object_1 : register(t41, space2);
+[[vk::binding(42, 2)]]
+Texture2D<float4> texture_object_0 : register(t42, space2);
 
 static float4 gl_FragCoord;
 static uint in_var_INSTANCEID;

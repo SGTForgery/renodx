@@ -1,7 +1,7 @@
 #include "../common.hlsl"
 
-[[vk::binding(0, 4)]]
-cbuffer type_ctime_cb : register(b0, space4)
+[[vk::binding(0, 9)]]
+cbuffer type_ctime_cb : register(b0, space9)
 {
     float ctime_cb_time : packoffset(c0);
     float ctime_cb_sdr_scale : packoffset(c0.y);
@@ -44,16 +44,15 @@ cbuffer type_ctime_cb : register(b0, space4)
     uint ctime_cb_poisoned : packoffset(c28);
 };
 
-[[vk::binding(0, 0)]]
-SamplerState SamplerLinearWrap : register(s0, space0);
+[[vk::binding(12, 0)]]
+SamplerState SamplerLinearWrapOffsetNoBias : register(s12, space0);
 
-[[vk::binding(21, 2)]]
-Texture2D<float4> tex : register(t21, space2);
+[[vk::binding(0, 5)]]
+Texture2D<float4> tex : register(t0, space5);
 
 static float2 in_var_TEXCOORD0;
 static float4 in_var_COLOR0;
 static float4 in_var_TEXCOORD1;
-static float4 in_var_COLOR1;
 static float4 out_var_SV_TARGET;
 
 struct SPIRV_Cross_Input
@@ -61,7 +60,6 @@ struct SPIRV_Cross_Input
     float2 in_var_TEXCOORD0 : TEXCOORD0;
     float4 in_var_COLOR0 : TEXCOORD1;
     float4 in_var_TEXCOORD1 : TEXCOORD2;
-    float4 in_var_COLOR1 : TEXCOORD3;
 };
 
 struct SPIRV_Cross_Output
@@ -71,10 +69,10 @@ struct SPIRV_Cross_Output
 
 void frag_main()
 {
-    float4 _59 = lerp(in_var_COLOR0, in_var_COLOR1, smoothstep(0.0f, ctime_cb_line_height, in_var_TEXCOORD1.w).xxxx) * lerp(1.0f.xxxx, tex.Sample(SamplerLinearWrap, in_var_TEXCOORD0), in_var_TEXCOORD1.y.xxxx);
-    float3 _60 = _59.xyz;
-    float3 _color = lerp(dot(_60, float3(0.300000011920928955078125f, 0.589999973773956298828125f, 0.10999999940395355224609375f)).xxx, _60, in_var_TEXCOORD1.x.xxx).xyz;
-    out_var_SV_TARGET = ApplyUIProcessing(_color, _59.w);
+    float4 _49 = in_var_COLOR0 * lerp(1.0f.xxxx, tex.Sample(SamplerLinearWrapOffsetNoBias, in_var_TEXCOORD0), in_var_TEXCOORD1.y.xxxx);
+    float3 _50 = _49.xyz;
+    float3 _ui_color = lerp(dot(_50, float3(0.300000011920928955078125f, 0.589999973773956298828125f, 0.10999999940395355224609375f)).xxx, _50, in_var_TEXCOORD1.x.xxx).xyz;
+    out_var_SV_TARGET = ApplyUIProcessing(_ui_color, _49.w);
 }
 
 SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)
@@ -82,7 +80,6 @@ SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)
     in_var_TEXCOORD0 = stage_input.in_var_TEXCOORD0;
     in_var_COLOR0 = stage_input.in_var_COLOR0;
     in_var_TEXCOORD1 = stage_input.in_var_TEXCOORD1;
-    in_var_COLOR1 = stage_input.in_var_COLOR1;
     frag_main();
     SPIRV_Cross_Output stage_output;
     stage_output.out_var_SV_TARGET = out_var_SV_TARGET;

@@ -40,6 +40,7 @@ struct ShaderInjectData {
   float rendering_fog_haze_aa;
   float rendering_fog_color_correction;
   float rendering_isfast_noise;
+  float rendering_temporal_shadows;
 };
 
 #ifndef __cplusplus

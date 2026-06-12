@@ -1,7 +1,7 @@
 #version 450
 #extension GL_EXT_spirv_intrinsics : require
 
-layout(set = 4, binding = 0, std140) uniform type_cdepth_aware_blur_cb
+layout(set = 9, binding = 0, std140) uniform type_cdepth_aware_blur_cb
 {
     int viewport_width;
     int viewport_height;
@@ -11,7 +11,7 @@ layout(set = 4, binding = 0, std140) uniform type_cdepth_aware_blur_cb
 } cdepth_aware_blur_cb;
 
 layout(set = 0, binding = 11) uniform sampler SamplerPointClampNoBias;
-layout(set = 2, binding = 17) uniform texture2D src_sampler;
+layout(set = 5, binding = 0) uniform texture2D src_sampler;
 
 layout(location = 0) out vec4 out_var_SV_TARGET;
 

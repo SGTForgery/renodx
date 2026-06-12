@@ -49,6 +49,7 @@ layout(push_constant) uniform RenoDXPushConstants {
     float rendering_fog_haze_aa;         // 124
     float rendering_fog_color_correction;// 128
     float rendering_isfast_noise;        // 132
+    float rendering_temporal_shadows;    // 136
 } pc;
 
 // ----------------------------------------------------------------------------
@@ -166,6 +167,78 @@ float rdx_cubemap_modulation(vec3 skyLight, float roughness, float aoFactor) {
                      * mix(0.5, 1.0, clamp(roughness, 0.0, 1.0))
                      * mix(0.4, 1.0, clamp(aoFactor, 0.0, 1.0));
     return mix(0.3, 1.0, mod_factor);
+}
+
+// ----------------------------------------------------------------------------
+// Local Light Shadow Sampling — 12-tap Vogel Disk PCF
+// Centralized function for all 21 inline PCF loops in the uber body.
+// Debug defines at the top of clustered_uber_body.glsl control behavior.
+//
+// Parameters:
+//   shadowAtlas   — the shadow atlas texture (set 1, binding 41)
+//   shadowSampler — comparison sampler (set 1, binding 32)
+//   shadowUV      — projected UV in atlas space (already flipped Y)
+//   compDepth     — linearized comparison depth
+//   rotation      — IGN-based rotation for this pixel (already scaled by 2PI or prior)
+//   tileMin       — atlas tile min bounds + texel border
+//   tileMax       — atlas tile max bounds - texel border
+//   texelSize     — _21._m33 (global shadow texel size)
+//   pixelCoord    — output pixel coordinate (for debug visualization imageStore)
+//   outputImg0    — writeonly image for diffuse output (for debug visualization)
+//   outputImg1    — writeonly image for specular output (for debug visualization)
+// Returns: shadow factor [0,1] where 1 = fully lit, 0 = fully shadowed
+//          returns -1.0 as sentinel for visualization modes (caller must `return`)
+// ----------------------------------------------------------------------------
+float rdx_shadow_pcf(texture2D shadowAtlas, sampler shadowSampler,
+                     vec2 shadowUV, float compDepth, float rotation,
+                     vec2 tileMin, vec2 tileMax, vec2 texelSize,
+                     ivec2 pixelCoord,
+                     writeonly image2D outputImg0, writeonly image2D outputImg1) {
+
+    // Mode 4: disable all local light shadows (return fully lit)
+    if (pc.rendering_temporal_shadows > 3.5 && pc.rendering_temporal_shadows < 4.5) return 1.0;
+
+#ifdef DBG_SHADOW_VIS_UV
+    vec2 uv_norm = (shadowUV - tileMin) / max((tileMax - tileMin), vec2(0.001));
+    imageStore(outputImg0, pixelCoord, vec4(uv_norm, 0.0, 1.0));
+    imageStore(outputImg1, pixelCoord, vec4(vec3(0.0), 1.0));
+    return -1.0;
+#endif
+
+#ifdef DBG_SHADOW_VIS_DEPTH_DELTA
+    float center_depth = texelFetch(shadowAtlas, ivec2(shadowUV / texelSize), 0).x;
+    float delta = abs(compDepth - center_depth) * 10.0;
+    imageStore(outputImg0, pixelCoord, vec4(vec3(delta), 1.0));
+    imageStore(outputImg1, pixelCoord, vec4(vec3(0.0), 1.0));
+    return -1.0;
+#endif
+
+#ifdef DBG_SHADOW_VIS_TILE_SIZE
+    vec2 tile_extent = tileMax - tileMin;
+    float tile_area = tile_extent.x * tile_extent.y * 100.0;
+    imageStore(outputImg0, pixelCoord, vec4(tile_area, tile_extent, 1.0));
+    imageStore(outputImg1, pixelCoord, vec4(vec3(0.0), 1.0));
+    return -1.0;
+#endif
+
+#ifdef DBG_SHADOW_SINGLE_TAP
+    vec4 gather = textureGather(sampler2D(shadowAtlas, shadowSampler), shadowUV);
+    vec2 fr = fract(fma(vec2(1.0) / texelSize, shadowUV, vec2(0.5)));
+    vec4 cmp = vec4(lessThan(vec4(compDepth), gather));
+    return clamp(mix(mix(cmp.w, cmp.z, fr.x), mix(cmp.x, cmp.y, fr.x), fr.y), 0.0, 1.0);
+#else
+    float accum = 0.0;
+    for (int i = 0; i < 12; i++) {
+        float fi = float(uint(i));
+        float r = sqrt(fi + 0.5) * 0.288675129413604736328125;
+        float theta = fma(fi, 2.3999631404876708984375, rotation);
+        vec2 sampleUV = clamp(fma((vec3(cos(theta), sin(theta), r).xy * r) * 2.5, texelSize, shadowUV), tileMin, tileMax);
+        vec2 fr = fract(fma(vec2(1.0) / texelSize, sampleUV, vec2(0.5)));
+        vec4 cmp = vec4(lessThan(vec4(compDepth), textureGather(sampler2D(shadowAtlas, shadowSampler), sampleUV)));
+        accum += clamp(mix(mix(cmp.w, cmp.z, fr.x), mix(cmp.x, cmp.y, fr.x), fr.y), 0.0, 1.0);
+    }
+    return accum * 0.083333335816860198974609375;
+#endif
 }
 
 #endif // RDX_COMMON_GLSL

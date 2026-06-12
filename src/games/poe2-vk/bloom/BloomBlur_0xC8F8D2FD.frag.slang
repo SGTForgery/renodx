@@ -1,7 +1,7 @@
 #include "../common.hlsl"
 
-[[vk::binding(0, 4)]]
-cbuffer type_cdepth_aware_blur_cb : register(b0, space4)
+[[vk::binding(0, 9)]]
+cbuffer type_cdepth_aware_blur_cb : register(b0, space9)
 {
     int cdepth_aware_blur_cb_viewport_width : packoffset(c0);
     int cdepth_aware_blur_cb_viewport_height : packoffset(c0.y);
@@ -12,8 +12,8 @@ cbuffer type_cdepth_aware_blur_cb : register(b0, space4)
 
 [[vk::binding(9, 0)]]
 SamplerState SamplerLinearClampNoBias : register(s9, space0);
-[[vk::binding(17, 2)]]
-Texture2D<float4> src_sampler : register(t17, space2);
+[[vk::binding(0, 5)]]
+Texture2D<float4> src_sampler : register(t0, space5);
 
 static float4 gl_FragCoord;
 static float4 out_var_SV_TARGET;

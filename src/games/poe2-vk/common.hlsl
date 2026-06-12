@@ -1,6 +1,7 @@
 #include "./shared.h"
 #include "./macleod_boynton_purity.hlsl"
 #include "./psycho_test17_custom.hlsl"
+#include "./psycho_test20.hlsl"
 
 // Interleaved Gradient Noise (Jimenez 2014)
 // Returns a scalar in [0,1) with good spatial blue-noise properties.
@@ -8,12 +9,9 @@ float InterleavedGradientNoise(float2 pixelCoord) {
   return frac(52.9829189f * frac(mad(0.06711056f, pixelCoord.x, 0.00583715f * pixelCoord.y)));
 }
 
-// Luminance-based gamma correction that preserves per-channel chrominance (hue).
+// Per channel gamma correction
 float3 ApplyGammaCorrectionByLuminance(float3 color_input) {
-  float y_in = renodx::color::y::from::BT709(color_input);
-  float y_out = renodx::color::correct::Gamma(max(0, y_in));
-  float3 color_output = renodx::color::correct::Luminance(color_input, y_in, y_out);
-  return color_output;
+  return renodx::color::correct::GammaSafe(color_input);
 }
 
 // Processes UI shader output: neutralizes vanilla sdr_scale, applies UI gamma
@@ -600,6 +598,51 @@ float3 PSYCHOGRADE(LUTSampleResult lut_sample) {
   float psycho_max_channel = max(output.r, max(output.g, output.b));
   if (psycho_max_channel > peak) {
     output *= peak / psycho_max_channel;
+  }
+
+  return output;
+}
+
+float3 PSYCHOGRADE_V20(LUTSampleResult lut_sample) {
+  float3 graded = lut_sample.graded;
+  float peak = shader_injection.peak_white_nits / shader_injection.diffuse_white_nits;
+
+  UserGradingConfig cg_config = CreateColorGradeConfig();
+
+  float3 output = renodx::tonemap::psychov::psychotm_test20(
+      graded,
+      peak,
+      1.f,
+      1.f,
+      1.f,
+      1.f,
+      1.f,
+      cg_config.chrominance_emulation_strength,
+      peak * 2.f,
+      cg_config.hue_emulation_strength,
+      1.f,
+      0,
+      1.f,
+      0.18f,
+      0.18f,
+      1.f,
+      1);
+
+  // Post-tonemap saturation, dechroma, highlight saturation via MB purity scaling.
+  {
+    UserGradingConfig sat_config = cg_config;
+    sat_config.hue_emulation_strength = 0.f;
+    sat_config.chrominance_emulation_strength = 0.f;
+    float y_out = renodx::color::y::from::BT709(output);
+    output = ApplySaturationBlowoutHueCorrectionHighlightSaturation(
+        output, 0.f, y_out, sat_config);
+  }
+
+  output = renodx::color::bt709::clamp::AP1(output);
+
+  float psycho20_max_channel = max(output.r, max(output.g, output.b));
+  if (psycho20_max_channel > peak) {
+    output *= peak / psycho20_max_channel;
   }
 
   return output;

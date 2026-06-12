@@ -14,12 +14,12 @@
 // 8 = force opacity to constant 0.5 (above threshold) — tests if flicker is from rasterization coverage
 // 9 = LOWERED THRESHOLD FIX: step(0.10, opacity) — catches most danger-zone pixels as "pass"
 //     Tune the value below: lower = denser shadows + less flicker, higher = thinner + more flicker
-#define DBG_SHADOW_MODE 0
+#define DBG_SHADOW_MODE 6
 
 // Tunable threshold for Mode 9 — adjust and hot-reload to find the sweet spot
 // 0.333 = vanilla (max flicker), 0.10 = very low (almost no flicker, dense shadows)
 // Try: 0.20, 0.15, 0.10
-#define DBG_FIX_THRESHOLD 0.15
+#define DBG_FIX_THRESHOLD 0.025
 
 // Coverage boost toggle (independent of noise mode)
 // 0 = no coverage boost (raw opacity values)

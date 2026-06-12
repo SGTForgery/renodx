@@ -110,6 +110,9 @@ int GetLastKeyPressedImGui() {
   return 0;
 }
 
+void ApplyPresetPsychoV20();
+void ApplyPresetPsychoV17();
+
 renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "SettingsMode",
@@ -126,12 +129,12 @@ renodx::utils::settings::Settings settings = {
         .key = "ToneMapType",
         .binding = &shader_injection.tone_map_type,
         .value_type = renodx::utils::settings::SettingValueType::INTEGER,
-        .default_value = 1.f,
+        .default_value = 2.f,
         .can_reset = false,
         .label = "Tone Mapper",
         .section = "Tone Mapping",
         .tooltip = "Sets the tone mapper type",
-        .labels = {"Vanilla", "Psycho V17"},
+        .labels = {"Vanilla", "Psycho V17", "Psycho V20"},
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
@@ -172,7 +175,7 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "Scene Gamma Correction",
         .section = "Tone Mapping",
-        .labels = {"Off", "2.2 By Luminance with Per Channel Chrominance"},
+        .labels = {"Off", "2.2 Per Channel"},
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
@@ -182,13 +185,13 @@ renodx::utils::settings::Settings settings = {
         .default_value = 1.f,
         .label = "UI Gamma Correction",
         .section = "Tone Mapping",
-        .labels = {"Off", "2.2 By Luminance with Per Channel Chrominance"},
+        .labels = {"Off", "2.2 Per Channel"},
         .is_visible = []() { return current_settings_mode >= 1; },
     },
     new renodx::utils::settings::Setting{
         .key = "ToneMapHueShift",
         .binding = &shader_injection.tone_map_hue_shift,
-        .default_value = 200.f,
+        .default_value = 0.f,
         .label = "Hue Shift",
         .section = "Tone Mapping",
         .tooltip = "Hue shift emulation strength.",
@@ -196,7 +199,7 @@ renodx::utils::settings::Settings settings = {
         .max = 200.f,
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value * 0.01f; },
-        .is_visible = []() { return false; },
+        //.is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "HueCorrection",
@@ -209,7 +212,7 @@ renodx::utils::settings::Settings settings = {
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value * 0.01f; },
-        .is_visible = []() { return false; },
+        //.is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "LavaHueCorrection",
@@ -258,7 +261,7 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "ColorGradeShadows",
         .binding = &shader_injection.tone_map_shadows,
-        .default_value = 50.f,
+        .default_value = 80.f,
         .label = "Shadows",
         .section = "Color Grading",
         .max = 100.f,
@@ -298,14 +301,14 @@ renodx::utils::settings::Settings settings = {
     new renodx::utils::settings::Setting{
         .key = "ColorGradeBlowout",
         .binding = &shader_injection.tone_map_dechroma,
-        .default_value = 0.f,
+        .default_value = 60.f,
         .label = "Blowout",
         .section = "Color Grading",
         .tooltip = "Controls highlight desaturation due to overexposure.",
         .max = 100.f,
         .is_enabled = []() { return shader_injection.tone_map_type >= 1; },
         .parse = [](float value) { return value * 0.01f; },
-        .is_visible = []() { return false; },
+        //.is_visible = []() { return false; },
     },
     new renodx::utils::settings::Setting{
         .key = "ColorGradeFlare",
@@ -447,6 +450,22 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .label = "Psycho V20",
+        .section = "Options",
+        .group = "button-line-1",
+        .tooltip = "Apply Psycho V20 preset with recommended settings",
+        .on_change = ApplyPresetPsychoV20,
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
+        .label = "Psycho V17",
+        .section = "Options",
+        .group = "button-line-1",
+        .tooltip = "Apply Psycho V17 preset with recommended settings",
+        .on_change = ApplyPresetPsychoV17,
+    },
+    new renodx::utils::settings::Setting{
+        .value_type = renodx::utils::settings::SettingValueType::BUTTON,
         .label = "Reset All",
         .section = "Options",
         .group = "button-line-1",
@@ -474,7 +493,7 @@ renodx::utils::settings::Settings settings = {
     },
     new renodx::utils::settings::Setting{
         .value_type = renodx::utils::settings::SettingValueType::TEXT,
-        .label = "- Addon maintained by Forge.",
+        .label = "- Addon maintained by Forge + Nilly (0.5).",
         .section = "About",
     },
     new renodx::utils::settings::Setting{
@@ -493,6 +512,54 @@ renodx::utils::settings::Settings settings = {
         .section = "About",
     },
 };
+
+void ApplyPresetPsychoV20() {
+  renodx::utils::settings::UpdateSetting("ToneMapType", 2.f);
+  renodx::utils::settings::UpdateSetting("ToneMapHueShift", 75.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeBlowout", 60.f);
+  renodx::utils::settings::UpdateSetting("GammaCorrection", 1.f);
+  renodx::utils::settings::UpdateSetting("SwapChainGammaCorrection", 1.f);
+  renodx::utils::settings::UpdateSetting("HueCorrection", 10.f);
+  renodx::utils::settings::UpdateSetting("LavaHueCorrection", 0.f);
+  renodx::utils::settings::UpdateSetting("LavaSaturation", 50.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeExposure", 1.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeHighlights", 50.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeShadows", 80.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeContrast", 50.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeSaturation", 50.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeHighlightSaturation", 80.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeFlare", 0.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeScene", 100.f);
+  renodx::utils::settings::UpdateSetting("FxGrainStrength", 0.f);
+  renodx::utils::settings::UpdateSetting("VignetteStrength", 0.f);
+  renodx::utils::settings::UpdateSetting("BloomStrength", 100.f);
+  renodx::utils::settings::UpdateSetting("BloomScaling", 60.f);
+  renodx::utils::settings::UpdateSetting("HideUI", 0.f);
+}
+
+void ApplyPresetPsychoV17() {
+  renodx::utils::settings::UpdateSetting("ToneMapType", 1.f);
+  renodx::utils::settings::UpdateSetting("ToneMapHueShift", 200.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeBlowout", 60.f);
+  renodx::utils::settings::UpdateSetting("GammaCorrection", 1.f);
+  renodx::utils::settings::UpdateSetting("SwapChainGammaCorrection", 1.f);
+  renodx::utils::settings::UpdateSetting("HueCorrection", 10.f);
+  renodx::utils::settings::UpdateSetting("LavaHueCorrection", 0.f);
+  renodx::utils::settings::UpdateSetting("LavaSaturation", 50.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeExposure", 1.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeHighlights", 50.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeShadows", 80.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeContrast", 50.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeSaturation", 50.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeHighlightSaturation", 80.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeFlare", 0.f);
+  renodx::utils::settings::UpdateSetting("ColorGradeScene", 100.f);
+  renodx::utils::settings::UpdateSetting("FxGrainStrength", 0.f);
+  renodx::utils::settings::UpdateSetting("VignetteStrength", 0.f);
+  renodx::utils::settings::UpdateSetting("BloomStrength", 100.f);
+  renodx::utils::settings::UpdateSetting("BloomScaling", 60.f);
+  renodx::utils::settings::UpdateSetting("HideUI", 0.f);
+}
 
 void OnPresetOff() {
   renodx::utils::settings::UpdateSetting("ToneMapType", 0.f);

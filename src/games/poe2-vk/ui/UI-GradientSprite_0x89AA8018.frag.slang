@@ -1,7 +1,7 @@
 #include "../common.hlsl"
 
-[[vk::binding(0, 4)]]
-cbuffer type_ctime_cb : register(b0, space4)
+[[vk::binding(0, 9)]]
+cbuffer type_ctime_cb : register(b0, space9)
 {
     float ctime_cb_time : packoffset(c0);
     float ctime_cb_sdr_scale : packoffset(c0.y);
@@ -44,23 +44,24 @@ cbuffer type_ctime_cb : register(b0, space4)
     uint ctime_cb_poisoned : packoffset(c28);
 };
 
-[[vk::binding(12, 0)]]
-SamplerState SamplerLinearWrapOffsetNoBias : register(s12, space0);
+[[vk::binding(0, 0)]]
+SamplerState SamplerLinearWrap : register(s0, space0);
 
-[[vk::binding(18, 2)]]
-Texture2D<float4> tex : register(t18, space2);
+[[vk::binding(0, 5)]]
+Texture2D<float4> tex : register(t0, space5);
 
-[[vk::binding(19, 2)]]
-Texture2D<float4> mask_tex : register(t19, space2);
-
-static float4 gl_FragCoord;
 static float2 in_var_TEXCOORD0;
+static float4 in_var_COLOR0;
+static float4 in_var_TEXCOORD1;
+static float4 in_var_COLOR1;
 static float4 out_var_SV_TARGET;
 
 struct SPIRV_Cross_Input
 {
     float2 in_var_TEXCOORD0 : TEXCOORD0;
-    float4 gl_FragCoord : SV_Position;
+    float4 in_var_COLOR0 : TEXCOORD1;
+    float4 in_var_TEXCOORD1 : TEXCOORD2;
+    float4 in_var_COLOR1 : TEXCOORD3;
 };
 
 struct SPIRV_Cross_Output
@@ -70,17 +71,18 @@ struct SPIRV_Cross_Output
 
 void frag_main()
 {
-    float4 _43 = tex.Sample(SamplerLinearWrapOffsetNoBias, in_var_TEXCOORD0);
-    float _66 = _43.w;
-    float3 _color = float4(((mask_tex.Sample(SamplerLinearWrapOffsetNoBias, float2((gl_FragCoord.x - float(ctime_cb_x_displacement)) / float(ctime_cb_mask_width), (gl_FragCoord.y - float(ctime_cb_y_displacement)) / float(ctime_cb_mask_height))) * _66) + _43).xyz * ctime_cb_effect_phase, _66).xyz;
-    out_var_SV_TARGET = ApplyUIProcessing(_color, _66);
+    float4 _59 = lerp(in_var_COLOR0, in_var_COLOR1, smoothstep(0.0f, ctime_cb_line_height, in_var_TEXCOORD1.w).xxxx) * lerp(1.0f.xxxx, tex.Sample(SamplerLinearWrap, in_var_TEXCOORD0), in_var_TEXCOORD1.y.xxxx);
+    float3 _60 = _59.xyz;
+    float3 _color = lerp(dot(_60, float3(0.300000011920928955078125f, 0.589999973773956298828125f, 0.10999999940395355224609375f)).xxx, _60, in_var_TEXCOORD1.x.xxx).xyz;
+    out_var_SV_TARGET = ApplyUIProcessing(_color, _59.w);
 }
 
 SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)
 {
-    gl_FragCoord = stage_input.gl_FragCoord;
-    gl_FragCoord.w = 1.0 / gl_FragCoord.w;
     in_var_TEXCOORD0 = stage_input.in_var_TEXCOORD0;
+    in_var_COLOR0 = stage_input.in_var_COLOR0;
+    in_var_TEXCOORD1 = stage_input.in_var_TEXCOORD1;
+    in_var_COLOR1 = stage_input.in_var_COLOR1;
     frag_main();
     SPIRV_Cross_Output stage_output;
     stage_output.out_var_SV_TARGET = out_var_SV_TARGET;

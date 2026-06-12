@@ -1,7 +1,7 @@
 #include "../common.hlsl"
 
-[[vk::binding(0, 4)]]
-cbuffer type_cminimap_vertex_transform_cb : register(b0, space4)
+[[vk::binding(0, 9)]]
+cbuffer type_cminimap_vertex_transform_cb : register(b0, space9)
 {
     float4 cminimap_vertex_transform_cb_x_basis : packoffset(c0);
     float4 cminimap_vertex_transform_cb_y_basis : packoffset(c1);
@@ -27,11 +27,11 @@ cbuffer type_cminimap_vertex_transform_cb : register(b0, space4)
 [[vk::binding(13, 0)]]
 SamplerState SamplerLinearClampOffsetNoBias : register(s13, space0);
 
-[[vk::binding(19, 2)]]
-Texture2D<float4> tilemap_sampler : register(t19, space2);
+[[vk::binding(0, 5)]]
+Texture2D<float4> tilemap_sampler : register(t0, space5);
 
-[[vk::binding(20, 2)]]
-Texture2D<float4> visibility_sampler : register(t20, space2);
+[[vk::binding(1, 5)]]
+Texture2D<float4> visibility_sampler : register(t1, space5);
 
 static float4 gl_FragCoord;
 static float2 in_var_TEXCOORD1;

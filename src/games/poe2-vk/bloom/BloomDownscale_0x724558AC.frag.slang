@@ -1,7 +1,7 @@
 #include "../common.hlsl"
 
-[[vk::binding(0, 4)]]
-cbuffer type_cdynamic_resolution_scale_cb : register(b0, space4)
+[[vk::binding(0, 9)]]
+cbuffer type_cdynamic_resolution_scale_cb : register(b0, space9)
 {
     float4 cdynamic_resolution_scale_cb_dynamic_resolution_scale : packoffset(c0);
     float4 cdynamic_resolution_scale_cb_src_size : packoffset(c1);
@@ -13,8 +13,8 @@ cbuffer type_cdynamic_resolution_scale_cb : register(b0, space4)
 
 [[vk::binding(1, 0)]]
 SamplerState SamplerLinearClamp : register(s1, space0);
-[[vk::binding(17, 2)]]
-Texture2D<float4> tex_sampler : register(t17, space2);
+[[vk::binding(0, 5)]]
+Texture2D<float4> tex_sampler : register(t0, space5);
 
 static float4 gl_FragCoord;
 static float4 out_var_SV_TARGET;

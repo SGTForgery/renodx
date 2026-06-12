@@ -1,7 +1,7 @@
 #include "../common.hlsl"
 
-[[vk::binding(0, 4)]]
-cbuffer type_cpost_processing_desc_cb : register(b0, space4)
+[[vk::binding(0, 9)]]
+cbuffer type_cpost_processing_desc_cb : register(b0, space9)
 {
     int cpost_processing_desc_cb_viewport_width : packoffset(c0);
     int cpost_processing_desc_cb_viewport_height : packoffset(c0.y);
@@ -11,8 +11,8 @@ cbuffer type_cpost_processing_desc_cb : register(b0, space4)
 
 [[vk::binding(1, 0)]]
 SamplerState SamplerLinearClamp : register(s1, space0);
-[[vk::binding(17, 2)]]
-Texture2D<float4> source_sampler : register(t17, space2);
+[[vk::binding(0, 5)]]
+Texture2D<float4> source_sampler : register(t0, space5);
 
 static float4 gl_FragCoord;
 static float4 out_var_SV_TARGET;

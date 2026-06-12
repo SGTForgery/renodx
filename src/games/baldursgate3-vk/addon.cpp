@@ -346,6 +346,17 @@ renodx::utils::settings::Settings settings = {
         }),
 
     new renodx::utils::settings::Setting({
+            .key = "RenderingTemporalShadows",
+            .binding = &shader_injection.rendering_temporal_shadows,
+            .value_type = renodx::utils::settings::SettingValueType::INTEGER,
+            .default_value = 0.f,
+            .label = "Shadow System",
+            .section = "Rendering",
+            .tooltip = "Shadow system modes. Mode 2 visualizes the temporal shadow SRV (binding 3) for diagnostics. Mode 4 disables all local light shadows.",
+            .labels = {"Off", "Reserved", "Visualize Shadow SRV", "Visualize Resolve UAV", "No Local Shadows"},
+        }),
+
+    new renodx::utils::settings::Setting({
             .key = "RenderingMicroShadowsDebug",
             .binding = &shader_injection.rendering_micro_shadows_debug,
             .value_type = renodx::utils::settings::SettingValueType::BOOLEAN,

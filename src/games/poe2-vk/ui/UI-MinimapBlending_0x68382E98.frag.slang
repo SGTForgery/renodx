@@ -2,8 +2,8 @@
 
 static float _64 = 0.0f;
 
-[[vk::binding(0, 4)]]
-cbuffer type_cminimap_blending_pixel_cb : register(b0, space4)
+[[vk::binding(0, 9)]]
+cbuffer type_cminimap_blending_pixel_cb : register(b0, space9)
 {
     float4 cminimap_blending_pixel_cb_viewport_size : packoffset(c0);
     float cminimap_blending_pixel_cb_geometry_opacity : packoffset(c1);
@@ -15,11 +15,11 @@ cbuffer type_cminimap_blending_pixel_cb : register(b0, space4)
 [[vk::binding(13, 0)]]
 SamplerState SamplerLinearClampOffsetNoBias : register(s13, space0);
 
-[[vk::binding(17, 2)]]
-Texture2D<float4> walkability_sampler : register(t17, space2);
+[[vk::binding(0, 5)]]
+Texture2D<float4> walkability_sampler : register(t0, space5);
 
-[[vk::binding(18, 2)]]
-Texture2D<float4> geometry_sampler : register(t18, space2);
+[[vk::binding(1, 5)]]
+Texture2D<float4> geometry_sampler : register(t1, space5);
 
 static float4 gl_FragCoord;
 static float4 out_var_SV_TARGET;
