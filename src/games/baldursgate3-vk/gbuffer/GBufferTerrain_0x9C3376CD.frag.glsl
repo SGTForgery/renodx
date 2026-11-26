@@ -1179,7 +1179,22 @@ void main()
     vec3 _2042 = _279 * _2041;
     vec3 _2045 = normalize(cross(_279, vec3(0.0, 0.0, 1.0))) * _2041;
     vec3 _2059 = (mat3(_2045, normalize(cross(_2045, _2042)), _2042) * (_2027 * ((_2028 > 0.001000000047497451305389404296875) ? inversesqrt(_2028) : 1.0))) * mat3(_8._m0[0].xyz, _8._m0[1].xyz, _8._m0[2].xyz);
-    vec2 _2081 = (((_2059.xy / vec2(1.0 - _2059.z)) * vec2(0.562524616718292236328125)) * 0.5) + vec2(0.5);
+    // RenoDX: guard the stereographic normal encoding (xy / (1 - z)).
+    // With BG3's top-down camera, flat floors face the camera almost exactly (z -> 1),
+    // which gives Inf/NaN in the normal buffer; a zero-length normal map sample gives NaN.
+    // Those pixels end up as NaN in lighting, get blown up by the bloom mips and show as
+    // black squares. Keep the normal finite and just shy of the pole instead.
+    vec3 rdx_n = _2059;
+    if (any(isnan(rdx_n)) || any(isinf(rdx_n))) {
+        rdx_n = vec3(0.0, 0.0, 1.0);
+        if (any(isnan(rdx_n)) || any(isinf(rdx_n))) rdx_n = vec3(0.0, 0.0, 1.0);
+    }
+    if (rdx_n.z > 0.999) {
+        float rdx_l = length(rdx_n.xy);
+        vec2 rdx_dir = (rdx_l > 1.0e-6) ? (rdx_n.xy / rdx_l) : vec2(1.0, 0.0);
+        rdx_n = vec3(rdx_dir * sqrt(1.0 - 0.999 * 0.999), 0.999);
+    }
+    vec2 _2081 = (((rdx_n.xy / vec2(1.0 - rdx_n.z)) * vec2(0.562524616718292236328125)) * 0.5) + vec2(0.5);
     vec3 _2083 = clamp(_2026, vec3(0.0), vec3(1.0));
     vec4 _2084 = vec4(_2083.x, _2083.y, _2083.z, _255.w);
     _2084.w = _2024.z + _2025;

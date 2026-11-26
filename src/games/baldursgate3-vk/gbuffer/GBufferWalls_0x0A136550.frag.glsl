@@ -84,7 +84,22 @@ void main()
     vec3 _175 = (_172.wzy * 2.0) - vec3(1.0);
     vec4 _176 = vec4(_175.x, _175.y, _175.z, _172.x);
     _176.z = -_175.z;
-    vec2 _239 = (((_137.xy / vec2(1.0 - _137.z)) * vec2(0.562524616718292236328125)) * 0.5) + vec2(0.5);
+    // RenoDX: guard the stereographic normal encoding (xy / (1 - z)).
+    // With BG3's top-down camera, flat floors face the camera almost exactly (z -> 1),
+    // which gives Inf/NaN in the normal buffer; a zero-length normal map sample gives NaN.
+    // Those pixels end up as NaN in lighting, get blown up by the bloom mips and show as
+    // black squares. Keep the normal finite and just shy of the pole instead.
+    vec3 rdx_n = _137;
+    if (any(isnan(rdx_n)) || any(isinf(rdx_n))) {
+        rdx_n = vec3(0.0, 0.0, 1.0);
+        if (any(isnan(rdx_n)) || any(isinf(rdx_n))) rdx_n = vec3(0.0, 0.0, 1.0);
+    }
+    if (rdx_n.z > 0.999) {
+        float rdx_l = length(rdx_n.xy);
+        vec2 rdx_dir = (rdx_l > 1.0e-6) ? (rdx_n.xy / rdx_l) : vec2(1.0, 0.0);
+        rdx_n = vec3(rdx_dir * sqrt(1.0 - 0.999 * 0.999), 0.999);
+    }
+    vec2 _239 = (((rdx_n.xy / vec2(1.0 - rdx_n.z)) * vec2(0.562524616718292236328125)) * 0.5) + vec2(0.5);
     vec3 _241 = clamp(mix(vec4(texture(sampler2D(_19, _13), _104).xyz, _76).xyz, texture(sampler2D(_20, _13), _3 * vec2(20.0)).xyz, vec3((pow(spvNMax(abs(1.0 - clamp(dot(normalize(fma(_86, normalize(_160.xyz).xyz * _169, normalize(_176.xyz).xyz)), normalize(normalize(-_7) * _125)), 0.0, 1.0)), 9.9999997473787516355514526367188e-05), 1.0) * _169) * _15._m2)), vec3(0.0), vec3(1.0));
     vec4 _242 = vec4(_241.x, _241.y, _241.z, _77.w);
     _242.w = texture(sampler2D(_17, _13), _104).z;

@@ -52,7 +52,21 @@ struct SPIRV_Cross_Output
 
 void frag_main()
 {
-    _5 = mad(_9.SampleLevel(_7, clamp(_4 * _6_m15, _6_m11, _6_m12), 0.0f), (0.20000000298023223876953125f * RENODX_CUSTOM_BLOOM).xxxx, _8.Load(int3(int3(int(gl_FragCoord.x), int(gl_FragCoord.y), 0).xy, 0)));
+    float4 bloom = _9.SampleLevel(_7, clamp(_4 * _6_m15, _6_m11, _6_m12), 0.0f);
+    float4 scene = _8.Load(int3(int3(int(gl_FragCoord.x), int(gl_FragCoord.y), 0).xy, 0));
+
+    // A single NaN/Inf pixel that reaches the bloom chain gets blown up by the small
+    // bloom mips into whole blocks, which then turn black after grading.
+    // Drop non-finite bloom, and keep the scene itself finite (Inf -> FP max, NaN -> 0).
+    [unroll]
+    for (int i = 0; i < 4; ++i) {
+        if (isnan(bloom[i]) || isinf(bloom[i])) bloom[i] = 0.f;
+        if (isnan(scene[i])) scene[i] = 0.f;
+        else if (isinf(scene[i])) scene[i] = scene[i] > 0.f ? 65000.f : 0.f;
+    }
+    bloom = clamp(bloom, 0.f, 65000.f);
+
+    _5 = mad(bloom, (0.20000000298023223876953125f * RENODX_CUSTOM_BLOOM).xxxx, scene);
 }
 
 SPIRV_Cross_Output main(SPIRV_Cross_Input stage_input)
