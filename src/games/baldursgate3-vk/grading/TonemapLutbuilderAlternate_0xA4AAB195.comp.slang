@@ -33,7 +33,10 @@ void comp_main()
     float3 _298 = pow(abs(_294), 6.277394771575927734375f.xxx) * 10000.0f;
     float3 untonemapped_ap1 = float3(_295.x ? 0.0f.xxx.x : _298.x, _295.y ? 0.0f.xxx.y : _298.y, _295.z ? 0.0f.xxx.z : _298.z) / (10000.0f / _4_m0[6].x).xxx;
 
-    if (RENODX_TONE_MAP_TYPE != 0.f) {
+    // Only take over when this LUT is a display (PQ) LUT. In the other modes the game
+    // builds a linear grading LUT here (used by ColorGrade 0x81C27E5C), which must stay
+    // vanilla, otherwise PQ values end up in the linear scene buffer.
+    if (_280 == 1 && RENODX_TONE_MAP_TYPE != 0.f) {
         float3 color = renodx::color::bt709::from::AP1(untonemapped_ap1);
         color = GammaCorrectHuePreserving(color);
         float3 bt2020 = renodx::color::bt2020::from::BT709(color);
